@@ -1,0 +1,18 @@
+# This repository exists to reproduce bytes exactly, so line endings must never depend on the
+# platform or on a developer's local core.autocrlf setting. LF in the repository, LF in every
+# checkout, on every OS.
+#
+# Why it matters here specifically: the .comp manifest is compared byte-for-byte, and the
+# generators that produce it are Swift sources whose content is read back verbatim. A silent
+# CRLF rewrite on one machine and not another turns a real diff into noise, or worse, hides one.
+* text=auto eol=lf
+
+# Never munge binary assets.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.icns binary
+*.pdf binary
+*.psd binary
+*.psb binary

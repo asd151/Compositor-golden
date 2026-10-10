@@ -1,0 +1,113 @@
+name: Golden corpus
+
+# Produces the reference artifacts the Windows port is tested against, by running the real
+# macOS code. Deliberately manual: the corpus should change only when someone means it to, and
+# every run needs a human look at the diff before the C# side is re-baselined.
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: Why this corpus is being regenerated (recorded in the run summary)
+        required: false
+        default: ''
+
+concurrency:
+  group: golden-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dump:
+    name: dump
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Select Xcode 26.6
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+
+      - name: Resolve Swift packages
+        run: >
+          xcodebuild -resolvePackageDependencies
+          -project Compositor.xcodeproj
+          -scheme Compositor
+          -onlyUsePackageVersionsFromResolvedFile
+
+      - name: Build for testing
+        run: >
+          xcodebuild build-for-testing
+          -project Compositor.xcodeproj
+          -scheme Compositor
+          -destination 'platform=macOS,arch=arm64'
+          -configuration Debug
+          -derivedDataPath DerivedData
+          CODE_SIGN_IDENTITY=-
+
+      # Only the dump suite. It writes golden-out/ at the repo root; the manifest it produces is
+      # also printed, so the CI log alone is enough to answer formatting questions without
+      # downloading the artifact.
+      - name: Generate golden corpus
+        run: >
+          xcodebuild test-without-building
+          -project Compositor.xcodeproj
+          -scheme Compositor
+          -destination 'platform=macOS,arch=arm64'
+          -derivedDataPath DerivedData
+          -resultBundlePath GoldenResults.xcresult
+          -parallel-testing-enabled NO
+          -only-testing:CompositorTests/GoldenDump
+
+      - name: List what was produced
+        if: always()
+        run: |
+          echo "--- golden-out tree ---"
+          if [ -d golden-out ]; then
+            find golden-out -type f | sort | while read -r f; do
+              printf '%10d  %s\n' "$(wc -c < "$f")" "$f"
+            done
+          else
+            echo "golden-out/ was not created"
+          fi
+
+      # always(): a dump that failed halfway is still worth inspecting, and the uploaded partial
+      # output plus the log is usually enough to fix it.
+      - name: Upload golden corpus
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: golden-corpus
+          path: golden-out
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload dump results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: golden-dump-results
+          path: '*.xcresult'
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Golden corpus dump"
+            echo ""
+            echo "Note: \`${{ inputs.note }}\`"
+            echo ""
+            if [ -d golden-out ]; then
+              echo "| bytes | file |"
+              echo "|---:|---|"
+              find golden-out -type f | sort | while read -r f; do
+                echo "| $(wc -c < "$f") | \`$f\` |"
+              done
+            else
+              echo "No \`golden-out/\` directory was produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
