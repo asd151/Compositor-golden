@@ -47,19 +47,45 @@ jobs:
           -derivedDataPath DerivedData
           CODE_SIGN_IDENTITY=-
 
-      # Only the dump suite. It writes golden-out/ at the repo root; the manifest it produces is
-      # also printed, so the CI log alone is enough to answer formatting questions without
-      # downloading the artifact.
+      # Only the dump suite.
+      #
+      # The test cannot write into the checkout: it runs inside the sandboxed app, which refuses
+      # any path outside the app's container (NSCocoaErrorDomain 513). So it writes into the
+      # container and prints "GOLDEN_DUMP_PATH=<dir>", which the next step reads back out of this
+      # log. Output is tee'd so the line survives even when the test fails.
+      #
+      # The manifest is also printed in full, so the log alone often answers a formatting
+      # question without needing the artifact at all.
       - name: Generate golden corpus
-        run: >
-          xcodebuild test-without-building
-          -project Compositor.xcodeproj
-          -scheme Compositor
-          -destination 'platform=macOS,arch=arm64'
-          -derivedDataPath DerivedData
-          -resultBundlePath GoldenResults.xcresult
-          -parallel-testing-enabled NO
-          -only-testing:CompositorTests/GoldenDump
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project Compositor.xcodeproj \
+            -scheme Compositor \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath DerivedData \
+            -resultBundlePath GoldenResults.xcresult \
+            -parallel-testing-enabled NO \
+            -only-testing:CompositorTests/GoldenDump 2>&1 | tee dump.log
+
+      - name: Collect the corpus
+        if: always()
+        run: |
+          reported=$(grep -o 'GOLDEN_DUMP_PATH=.*' dump.log | head -1 | cut -d= -f2- | tr -d '\r')
+          echo "reported: ${reported:-<nothing>}"
+          if [ -n "$reported" ] && [ -d "$reported" ]; then
+            mkdir -p golden-out
+            cp -R "$reported"/. golden-out/
+          else
+            echo "The test did not report a usable directory."
+            # Fall back to searching the container, so a changed bundle id does not lose the run.
+            found=$(find "$HOME/Library/Containers" -type d -name golden-out 2>/dev/null | head -1)
+            if [ -n "$found" ]; then
+              echo "found by search: $found"
+              mkdir -p golden-out
+              cp -R "$found"/. golden-out/
+            fi
+          fi
 
       - name: List what was produced
         if: always()

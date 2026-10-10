@@ -30,25 +30,29 @@ struct GoldenDump {
     }
 
     @Test func writeGoldenCorpus() async throws {
-        // Where the corpus lands: GOLDEN_DUMP_DIR when set, otherwise golden-out/ at the repo
-        // root. Deriving the default from #filePath avoids having to plumb an environment
-        // variable through xcodebuild into the hosted test bundle, which is not dependable.
-        // This suite is only ever run by the "Golden corpus" workflow, via
-        // -only-testing:CompositorTests/GoldenDump, so writing by default cannot pollute an
-        // ordinary test run.
-        let repoRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // CompositorTests/
-            .deletingLastPathComponent()   // repository root
+        // Where the corpus lands.
+        //
+        // Deliberately NOT the repository root. This test runs inside the sandboxed Compositor
+        // app, so it inherits the app's sandbox, and the sandbox refuses writes anywhere outside
+        // the app's own container - attempting it fails with NSCocoaErrorDomain 513, "Operation
+        // not permitted". The container's Documents directory is writable and survives the run.
+        // The resulting path is printed so the caller can collect from it rather than having to
+        // reconstruct it.
+        let container = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
         let out = ProcessInfo.processInfo.environment["GOLDEN_DUMP_DIR"]
             .map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? repoRoot.appendingPathComponent("golden-out", isDirectory: true)
+            ?? container.appendingPathComponent("golden-out", isDirectory: true)
 
         // Start clean so a stale artifact can never be mistaken for a fresh one.
         if FileManager.default.fileExists(atPath: out.path) {
             try FileManager.default.removeItem(at: out)
         }
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-        print("=== GOLDEN DUMP writing to \(out.path) ===")
+
+        // Printed first, so the location is known even if something later fails.
+        print("GOLDEN_DUMP_PATH=\(out.path)")
 
         var artifacts: [[String: Any]] = []
 
