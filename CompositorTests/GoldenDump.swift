@@ -265,6 +265,69 @@ struct GoldenDump {
         print("004 second save byte-identical to the first: \(hsvAgainManifest == hsvManifest)")
         artifacts.append(try Self.write(hsvAgainManifest, to: "004-hsv-again.manifest.json", in: out))
 
+        // ---------------------------------------------------------------- 005 adjustment pixels
+        //
+        // The manifests settle the file format; they say nothing about whether the port draws the same
+        // picture. These artifacts are that comparison: one input raster, and the output of every
+        // adjustment the port claims to reproduce exactly, as raw premultiplied RGBA8.
+        //
+        // Three things make this a fair test rather than a hopeful one.
+        //
+        // First, the inputs are dumped exactly as constructed, with no round trip, so the C# side is
+        // comparing against the bytes this file intended rather than against whatever a color-managed
+        // context would have made of them.
+        //
+        // Second, the round trip is dumped too. Reading pixels back needs a CGContext, and if that
+        // path is not the identity then every output below is shifted by it and the comparison would
+        // be measuring the harness. The round-trip artifact is byte-compared against the input by the
+        // C# probe, so that assumption is checked rather than assumed.
+        //
+        // Third, each adjustment is serialized with the project's own encoder. The port reads the
+        // settings back with the reader it already proved byte-exact, so no setting is retyped by hand
+        // on the far side and a disagreement can only be about pixels.
+        //
+        // The two Core Image blurs are deliberately absent. Their kernels are Apple's and unpublished
+        // (Filters.swift:210 and :214), so there is no reference pixel to match and claiming one would
+        // be a lie. See the plan's rendering section.
+        let pixelSide = 24
+        let opaqueInput = try #require(Self.makeInput(side: pixelSide, varyingAlpha: false),
+                                       "005 could not build the opaque input raster")
+        let alphaInput = try #require(Self.makeInput(side: pixelSide, varyingAlpha: true),
+                                      "005 could not build the varying-alpha input raster")
+
+        artifacts.append(try Self.write(Self.rawBytes(side: pixelSide, varyingAlpha: false),
+                                        to: "005-input-opaque.raw", in: out))
+        artifacts.append(try Self.write(Self.rawBytes(side: pixelSide, varyingAlpha: true),
+                                        to: "005-input-alpha.raw", in: out))
+        artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: opaqueInput), "005 round trip 1 failed"),
+                                        to: "005-roundtrip-opaque.raw", in: out))
+        artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: alphaInput), "005 round trip 2 failed"),
+                                        to: "005-roundtrip-alpha.raw", in: out))
+
+        let pixelEncoder = JSONEncoder()
+        pixelEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+
+        for (name, adjustment) in Self.pixelCases() {
+            // The same literals the manifest case uses, so a setting cannot drift between the two.
+            guard adjustment.isValid else {
+                print("005 ERROR: \(name) is not valid, skipping")
+                continue
+            }
+            artifacts.append(try Self.write(try pixelEncoder.encode(adjustment),
+                                            to: "005-\(name).adjustment.json", in: out))
+
+            for (suffix, input) in [("opaque", opaqueInput), ("alpha", alphaInput)] {
+                let rendered = try adjustment.apply(input)
+                let raw = try #require(Self.rgbaBytes(of: rendered), "005 \(name)/\(suffix) produced no bytes")
+                // A wrong length would let the C# side compare a truncated buffer successfully.
+                guard raw.count == pixelSide * pixelSide * 4 else {
+                    print("005 ERROR: \(name)/\(suffix) is \(raw.count) bytes, expected \(pixelSide * pixelSide * 4)")
+                    continue
+                }
+                artifacts.append(try Self.write(raw, to: "005-\(name)-\(suffix).raw", in: out))
+            }
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
@@ -318,6 +381,138 @@ struct GoldenDump {
         artifacts.append(try Self.write(metaJSON, to: "metadata.json", in: out))
 
         print("=== GOLDEN DUMP COMPLETE: \(artifacts.count) entries in \(out.path) ===")
+    }
+    // ------------------------------------------------------------------ 005 helpers
+
+    /// The input raster for the pixel comparison, built from a closed form rather than chosen.
+    ///
+    /// It has to be reproducible on the far side from the same arithmetic, so this uses integer
+    /// operations only: no floating point, no library rounding, no color management. Every channel
+    /// depends on both x and y, so neither a transposed nor a vertically flipped buffer can match by
+    /// accident - which is the point, since row order is exactly the kind of thing that differs
+    /// between two graphics stacks and is otherwise invisible.
+    static func rawBytes(side: Int, varyingAlpha: Bool) -> Data {
+        var bytes = [UInt8](repeating: 0, count: side * side * 4)
+        for y in 0..<side {
+            for x in 0..<side {
+                let i = (y * side + x) * 4
+                var r = (x * 16 + y * 3) % 256
+                var g = (x * 7 + y * 29) % 256
+                var b = (x * 31 + y * 11) % 256
+                let a = varyingAlpha ? ((x * 5 + y * 13) % 256) : 255
+                if varyingAlpha {
+                    // The raster is premultiplied, so a color above its alpha is not a color at all.
+                    // Clamping rather than dividing would hide a premultiplication bug.
+                    r = r * a / 255
+                    g = g * a / 255
+                    b = b * a / 255
+                }
+                bytes[i] = UInt8(r)
+                bytes[i + 1] = UInt8(g)
+                bytes[i + 2] = UInt8(b)
+                bytes[i + 3] = UInt8(a)
+            }
+        }
+        return Data(bytes)
+    }
+
+    static func makeInput(side: Int, varyingAlpha: Bool) -> CGImage? {
+        let data = rawBytes(side: side, varyingAlpha: varyingAlpha)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        return CGImage(width: side, height: side, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: side * 4,
+                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// Reads an image back as premultiplied RGBA8, in the layout the port uses.
+    ///
+    /// This is the one step that could quietly move every pixel: it goes through a CGContext, and if
+    /// that round trip is not the identity then the comparison measures the harness instead of the
+    /// renderer. Case 005 dumps the round trip alongside the input so the C# side can check it.
+    static func rgbaBytes(of image: CGImage) -> Data? {
+        let width = image.width, height = image.height
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        let ok = bytes.withUnsafeMutableBytes { buffer -> Bool in
+            guard let ctx = CGContext(data: buffer.baseAddress, width: width, height: height,
+                                      bitsPerComponent: 8, bytesPerRow: width * 4,
+                                      space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+                return false
+            }
+            ctx.interpolationQuality = .none
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        return ok ? Data(bytes) : nil
+    }
+
+    /// The adjustments whose arithmetic the port reproduces, using the literals from case 003 so a
+    /// setting cannot drift between the manifest artifact and the pixel artifact.
+    static func pixelCases() -> [(String, LayerAdjustment)] {
+        var cases: [(String, LayerAdjustment)] = []
+
+        var hsv = LayerAdjustment(kind: .hsv)
+        hsv.hue = 30; hsv.saturation = 40; hsv.lightness = -20; hsv.colorize = true
+        cases.append(("hsv", hsv))
+
+        var levels = LayerAdjustment(kind: .levels)
+        levels.levels.ranges = [
+            LevelRange(black: 10, gamma: 1.5, white: 240, outputBlack: 5, outputWhite: 250),
+            LevelRange(black: 0, gamma: 1, white: 255, outputBlack: 0, outputWhite: 255),
+            LevelRange(black: 20, gamma: 0.8, white: 200, outputBlack: 10, outputWhite: 220),
+            LevelRange(black: 5, gamma: 2, white: 250, outputBlack: 0, outputWhite: 255),
+        ]
+        cases.append(("levels", levels))
+
+        var curves = LayerAdjustment(kind: .curves)
+        curves.curves.channels[1] = [CurvePoint(x: 0, y: 0), CurvePoint(x: 128, y: 200),
+                                     CurvePoint(x: 255, y: 255)]
+        curves.curves.channels[3] = [CurvePoint(x: 0, y: 10), CurvePoint(x: 64, y: 30),
+                                     CurvePoint(x: 192, y: 240), CurvePoint(x: 255, y: 250)]
+        cases.append(("curves", curves))
+
+        var exposure = LayerAdjustment(kind: .exposure)
+        exposure.exposure = ExposureSettings(exposure: 1.5, offset: -0.25, gamma: 2.2)
+        cases.append(("exposure", exposure))
+
+        var gradient = LayerAdjustment(kind: .gradientMap)
+        gradient.gradientMap = GradientMapSettings(
+            shadows: AdjustmentColor(red: 0.1, green: 0.2, blue: 0.3),
+            highlights: AdjustmentColor(red: 0.9, green: 0.8, blue: 0.7),
+            reversed: true)
+        cases.append(("gradientMap", gradient))
+
+        var grain = LayerAdjustment(kind: .grain)
+        grain.grain = GrainSettings(amount: 30, size: 2.5, roughness: 60, seed: 123456)
+        cases.append(("grain", grain))
+
+        var noise = LayerAdjustment(kind: .addNoise)
+        noise.resolvedNoiseAmount = 15
+        noise.resolvedNoiseGaussian = true
+        noise.resolvedNoiseMonochromatic = true
+        noise.resolvedNoiseSeed = 654321
+        cases.append(("addNoise", noise))
+
+        // Invert carries no settings, so it is the control: the simplest case that must still match.
+        cases.append(("invert", LayerAdjustment(kind: .invert)))
+
+        var blackWhite = LayerAdjustment(kind: .blackWhite)
+        blackWhite.blackWhite = BlackWhiteSettings(reds: 45, yellows: 65, greens: 35, cyans: 55,
+                                                   blues: 25, magentas: 85, tint: true, tintHue: 200,
+                                                   tintSaturation: 15)
+        cases.append(("blackWhite", blackWhite))
+
+        var colorBalance = LayerAdjustment(kind: .colorBalance)
+        colorBalance.colorBalance = ColorBalanceSettings(
+            shadowCyanRed: 10, shadowMagentaGreen: -20, shadowYellowBlue: 30,
+            midCyanRed: -5, midMagentaGreen: 15, midYellowBlue: -25,
+            highlightCyanRed: 20, highlightMagentaGreen: 5, highlightYellowBlue: -10,
+            preserveLuminosity: false)
+        cases.append(("colorBalance", colorBalance))
+
+        return cases
     }
 }
 
