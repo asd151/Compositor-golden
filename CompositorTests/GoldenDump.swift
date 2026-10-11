@@ -1287,6 +1287,27 @@ struct GoldenDump {
                     print("014 ERROR: \(name) failed: \(error)")
                 }
             }
+            // The scope overlay. It is a different thing from the option-drag overlay above: that one is
+            // drawn by the grade through its `clipping` argument, while this one paints over an already
+            // graded image, which is what the histogram scope shows.
+            var scopeSource = CameraRawSettings()
+            scopeSource.exposure = 1.2
+            scopeSource.contrast = 40
+            scopeSource.shadows = -40
+            scopeSource.blacks = -35
+            do {
+                let graded = try scopeSource.apply(rawInput)
+                for (name, shadows, highlights) in [("014-scope-shadows.raw", true, false),
+                                                    ("014-scope-highlights.raw", false, true),
+                                                    ("014-scope-both.raw", true, true)] {
+                    let marked = try CameraRawScope.overlay(graded, shadows: shadows, highlights: highlights)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: marked),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                }
+            } catch {
+                print("014 ERROR: the scope overlay failed: \(error)")
+            }
         }
 
         // ---------------------------------------------------------------- package listing
