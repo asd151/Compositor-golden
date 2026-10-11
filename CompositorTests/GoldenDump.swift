@@ -395,7 +395,28 @@ struct GoldenDump {
 
             for (suffix, source) in [("opaque", blendOpaque), ("alpha", blendAlpha)] {
                 do {
-                    let context = try BrushRaster.context(width: blendSide, height: blendSide, mask: false)
+                    // A plain, unflipped context rather than BrushRaster.context, and that choice is
+                    // load-bearing. BrushRaster's context carries a flip (BrushStroke.swift:40-41) so
+                    // that its coordinate system has a top-left origin. An image drawn into a flipped
+                    // context lands upside down in the buffer, so reading that buffer back yields the
+                    // raster vertically mirrored - which is exactly what happened on the first run of
+                    // this case: "Normal" came out byte-equal to the source flipped, not to the source.
+                    //
+                    // The blend is per-pixel and so is unaffected by which pixel sits where; what the
+                    // flip breaks is the comparison, because the inputs are dumped top-down. Rather than
+                    // have the C# side mirror half the artifacts, the case draws into a context with no
+                    // transform, where an image drawn at the full extent reads back unchanged. Nothing
+                    // about the dispatch under test changes: SeparableBlend.draw and setBlendMode are
+                    // still the two paths, and both work on any bitmap context.
+                    guard let context = CGContext(data: nil, width: blendSide, height: blendSide,
+                                                  bitsPerComponent: 8, bytesPerRow: blendSide * 4,
+                                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                                                      | CGBitmapInfo.byteOrder32Big.rawValue) else {
+                        print("006 ERROR: \(slug)/\(suffix) could not make a context")
+                        continue
+                    }
+                    context.interpolationQuality = .none
                     context.draw(backdrop, in: blendRect)
 
                     if SeparableBlend.needsSurface(mode) {
