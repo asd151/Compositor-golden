@@ -791,6 +791,115 @@ struct GoldenDump {
             print("009 ERROR: the folder mask stack could not be rendered: \(error)")
         }
 
+        // ---------------------------------------------------------------- 010 clipping stacks
+        //
+        // A layer can name another as its clipping source. That is not "this layer is masked by that
+        // one" - the base and everything clipped to it are composited as a SINGLE unit and blended into
+        // the canvas once, in the BASE's mode (LiveMaskRenderer.swift:76-92,126-134). Two consequences
+        // fall out of that, and both are easy to get wrong in a port:
+        //
+        //   1. The children's own blend modes apply INSIDE the stack, against the base's color, not
+        //      against the canvas.
+        //   2. The base's opacity is applied to the base before the children are drawn, and the stack
+        //      then composites at full opacity - applying the base's opacity again would square it.
+        //
+        // The base here carries `screen` at 0.8 opacity, which makes both visible at once: a port that
+        // composited each layer separately would use each layer's own mode against the canvas, and one
+        // that applied the base's opacity at the end as well would darken the whole stack twice.
+        //
+        //   base   (0,0) 40x32              background
+        //   shape  (8,8) 20x16  screen 0.8  the stack's base; its ALPHA is the stack's clip
+        //   paint  (4,4) 24x20  normal      clipped to shape, and larger than it
+        //   tint   (4,4) 24x20  multiply    clipped to shape, multiplied against shape's color
+        //   gap    (2,20) 14x14 normal      breaks the run, so the next layer is not in the stack
+        //   late  (20,18) 18x12 normal      names shape but is NOT next to it
+        //   above (22,2) 16x16  normal      untouched by any of this
+        //
+        // "late" is the case a port most easily drops entirely: it is clipped to shape's alpha even
+        // though it is not part of shape's stack, because a clipping link is a clip whether or not the
+        // layers happen to be adjacent.
+        let clipCanvasWidth = 40
+        let clipCanvasHeight = 32
+
+        typealias ClippedLayer = (String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode,
+                                  Bool, CGFloat, Bool, String?, Bool, String?)
+        let clipStack: [ClippedLayer] = [
+            ("base",  0, clipCanvasWidth, clipCanvasHeight,  0,  0, 1.0, .normal,   false, 0, false, nil,     true,  nil),
+            ("shape", 1, 20,              16,                8,  8, 0.8, .screen,   false, 0, false, nil,     true,  nil),
+            ("paint", 2, 24,              20,                4,  4, 1.0, .normal,   false, 0, false, nil,     true,  "shape"),
+            ("tint",  3, 24,              20,                4,  4, 1.0, .multiply, false, 0, false, nil,     true,  "shape"),
+            ("gap",   1, 14,              14,                2, 20, 1.0, .normal,   false, 0, false, nil,     true,  nil),
+            ("late",  2, 18,              12,               20, 18, 1.0, .normal,   false, 0, false, nil,     true,  "shape"),
+            ("above", 1, 16,              16,               22,  2, 1.0, .normal,   false, 0, false, nil,     true,  nil),
+        ]
+
+        var clipIds: [String: UUID] = [:]
+        var clipRecords: [ProjectLayerRecord] = []
+        var clipImages: [UUID: ImportedImage] = [:]
+
+        for (slug, variant, pixelWidth, pixelHeight, x, y, opacity, blend,
+             masked, rotation, isGroup, parent, visible, source) in clipStack {
+            let id = UUID()
+            clipIds[slug] = id
+            if !isGroup {
+                guard let raster = Self.stackRaster(width: pixelWidth, height: pixelHeight, variant: variant),
+                      let thumbnail = Self.stackRaster(width: max(1, pixelWidth / 2), height: max(1, pixelHeight / 2),
+                                                       variant: variant) else {
+                    print("010 ERROR: could not build the \(slug) raster")
+                    continue
+                }
+                clipImages[id] = ImportedImage(image: raster, thumbnail: thumbnail, name: slug)
+            }
+            clipRecords.append(ProjectLayerRecord(
+                id: id, name: slug, isVisible: visible,
+                transform: LayerTransform(origin: CGPoint(x: x, y: y),
+                                          size: CGSize(width: pixelWidth, height: pixelHeight),
+                                          rotation: rotation),
+                imageFile: isGroup ? nil : "\(slug).png",
+                parentID: parent.flatMap { clipIds[$0] },
+                isGroup: isGroup, opacity: opacity, blendMode: blend,
+                maskFile: masked ? "\(slug)-mask.png" : nil,
+                maskSourceID: source.flatMap { clipIds[$0] }))
+        }
+
+        do {
+            let clipManifest = ProjectManifest(documentID: UUID(), width: clipCanvasWidth, height: clipCanvasHeight,
+                                               activeLayerID: nil, layers: clipRecords)
+            let clipRendered = try await ImageExporter.shared.render(
+                ProjectSnapshot(manifest: clipManifest, images: clipImages, masks: [:]))
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: clipRendered.image),
+                                                         "010 clipping stack produced no bytes"),
+                                            to: "010-stack.raw", in: out))
+
+            // The same stack with every clipping link cut, so the far side can measure how much the
+            // stacking actually changed rather than trusting that it did.
+            let looseRecords = clipRecords.map { record -> ProjectLayerRecord in
+                var copy = record
+                copy.maskSourceID = nil
+                return copy
+            }
+            let looseManifest = ProjectManifest(documentID: UUID(), width: clipCanvasWidth, height: clipCanvasHeight,
+                                                activeLayerID: nil, layers: looseRecords)
+            let looseRendered = try await ImageExporter.shared.render(
+                ProjectSnapshot(manifest: looseManifest, images: clipImages, masks: [:]))
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: looseRendered.image),
+                                                         "010-stack-unclipped.raw"),
+                                            to: "010-stack-unclipped.raw", in: out))
+
+            let described: [[String: Any]] = clipStack.map { layer in
+                ["slug": layer.0, "variant": layer.1, "pixelWidth": layer.2, "pixelHeight": layer.3,
+                 "x": Double(layer.4), "y": Double(layer.5), "opacity": layer.6,
+                 "blend": layer.7.rawValue, "masked": layer.8, "rotation": Double(layer.9),
+                 "isGroup": layer.10, "parent": layer.11 ?? "", "visible": layer.12,
+                 "source": layer.13 ?? ""]
+            }
+            artifacts.append(try Self.write(try JSONSerialization.data(
+                withJSONObject: ["width": clipCanvasWidth, "height": clipCanvasHeight, "layers": described],
+                options: [.prettyPrinted, .sortedKeys]), to: "010-clipping.json", in: out))
+        } catch {
+            print("010 ERROR: the clipping stack could not be rendered: \(error)")
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
