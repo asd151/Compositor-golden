@@ -982,6 +982,112 @@ struct GoldenDump {
             print("011 ERROR: could not build the input raster")
         }
 
+        // ---------------------------------------------------------------- 012 camera raw, the other stages
+        //
+        // The basic grade is one stage of six, and the ones around it are where the order stops being
+        // obvious. Calibration runs BEFORE the grade, because it reinterprets what the camera's
+        // primaries mean; running it afterwards is a different picture, and on a gentle test image the
+        // two are close enough to look like rounding.
+        //
+        // Effects runs after, and its five parts do not share a scale: the vignette is shaped to the
+        // frame, glow and local contrast are shaped in pixels, and `scale` is preview pixels per layer
+        // pixel, so the radii are divided by it. Grain is separate again and is the only stage that
+        // takes a seed, which is why it is dumped on its own - a port that reseeded per call would give
+        // a different pattern on every redraw instead of a still one.
+        //
+        // Each group is dumped alone before any of them are combined, so a mismatch names the stage.
+
+        if let rawInput = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            // Calibration alone. Nothing else is non-default, so the grade kernel does not run at all.
+            var calibrationV6 = CameraRawSettings()
+            calibrationV6.calibration.process = .version6
+            calibrationV6.calibration.shadowTint = 28
+            calibrationV6.calibration.redHue = -22
+            calibrationV6.calibration.redSaturation = 40
+            calibrationV6.calibration.greenHue = 15
+            calibrationV6.calibration.greenSaturation = -35
+            calibrationV6.calibration.blueHue = 30
+            calibrationV6.calibration.blueSaturation = 18
+
+            // The same amounts at Version 1, which moves them about half as far. A port that ignored the
+            // process version would make these two come out identical.
+            var calibrationV1 = calibrationV6
+            calibrationV1.calibration.process = .version1
+
+            // Effects alone: all five parts at once.
+            var effects = CameraRawSettings()
+            effects.texture = 45
+            effects.clarity = -30
+            effects.dehaze = 25
+            effects.glow = 60
+            effects.glowStyle = .halation
+            effects.glowRange = 40
+            effects.glowSpread = 20
+            effects.glowWarmth = 35
+            effects.vignetteAmount = -55
+            effects.vignetteStyle = .colorPriority
+            effects.vignetteMidpoint = 40
+            effects.vignetteRoundness = -25
+            effects.vignetteFeather = 65
+            effects.vignetteHighlights = 30
+
+            // Grain alone, at a seed that is not zero so a port that dropped the seed would differ.
+            var grain = CameraRawSettings()
+            grain.grainAmount = 70
+            grain.grainSize = 60
+            grain.grainRoughness = 35
+
+            // Everything on, in the order the pipeline runs: calibration, the grade, then effects.
+            var combined = CameraRawSettings()
+            combined.temperature = 42
+            combined.tint = -18
+            combined.exposure = 0.65
+            combined.contrast = 35
+            combined.highlights = -40
+            combined.shadows = 55
+            combined.whites = 20
+            combined.blacks = -15
+            combined.vibrance = 30
+            combined.saturation = -12
+            combined.calibration = calibrationV6.calibration
+            combined.texture = effects.texture
+            combined.clarity = effects.clarity
+            combined.dehaze = effects.dehaze
+            combined.glow = effects.glow
+            combined.glowStyle = effects.glowStyle
+            combined.glowRange = effects.glowRange
+            combined.glowSpread = effects.glowSpread
+            combined.glowWarmth = effects.glowWarmth
+            combined.vignetteAmount = effects.vignetteAmount
+            combined.vignetteStyle = effects.vignetteStyle
+            combined.vignetteMidpoint = effects.vignetteMidpoint
+            combined.vignetteRoundness = effects.vignetteRoundness
+            combined.vignetteFeather = effects.vignetteFeather
+            combined.vignetteHighlights = effects.vignetteHighlights
+            combined.grainAmount = grain.grainAmount
+            combined.grainSize = grain.grainSize
+            combined.grainRoughness = grain.grainRoughness
+
+            let renders: [(String, CameraRawSettings, CGFloat, UInt32)] = [
+                ("012-calibration-v6.raw", calibrationV6, 1, 0),
+                ("012-calibration-v1.raw", calibrationV1, 1, 0),
+                ("012-effects.raw", effects, 1, 0),
+                ("012-effects-scaled.raw", effects, 2, 0),
+                ("012-grain.raw", grain, 1, 7),
+                ("012-combined.raw", combined, 1, 7),
+            ]
+            for (name, settings, renderScale, renderSeed) in renders {
+                do {
+                    let rendered = try settings.apply(rawInput, scale: renderScale, seed: renderSeed)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                } catch {
+                    print("012 ERROR: \(name) failed: \(error)")
+                }
+            }
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
