@@ -107,37 +107,6 @@ struct GoldenDump {
         }
         artifacts.append(try Self.write(resaved, to: "002-resave.manifest.json", in: out))
 
-        // ---------------------------------------------------------------- package listing
-        // A sorted name/size/SHA256 index, so the C# harness never has to enumerate a
-        // filesystem to know what a golden contains.
-        var listing: [[String: Any]] = []
-        // Every package, so the C# harness never has to enumerate a filesystem to know what a golden
-        // contains. Paths are relative to the corpus root ("001-minimal.comp/manifest.json").
-        for (name, package) in [("001-minimal.comp", comp),
-                                ("003-adjustments.comp", adjustComp),
-                                ("004-hsv.comp", hsvComp)] {
-            guard let walker = FileManager.default.enumerator(
-                at: package, includingPropertiesForKeys: [.fileSizeKey]) else { continue }
-            for case let url as URL in walker {
-                let rel = name + "/" + url.path.replacingOccurrences(of: package.path + "/", with: "")
-                let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-                guard values.isRegularFile == true else { continue }
-                let data = try Data(contentsOf: url)
-                listing.append([
-                    "path": rel,
-                    "bytes": values.fileSize ?? 0,
-                    "sha256": SHA256Hex.of(data),
-                ])
-            }
-        }
-        listing.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
-
-        let packages = ["001-minimal.comp", "003-adjustments.comp", "004-hsv.comp"]
-        let treeJSON = try JSONSerialization.data(
-            withJSONObject: ["root": "001-minimal.comp", "packages": packages, "files": listing],
-            options: [.prettyPrinted, .sortedKeys])
-        artifacts.append(try Self.write(treeJSON, to: "tree.json", in: out))
-
         // ---------------------------------------------------------------- 003 adjustments
         // One adjustment layer per kind, with every setting non-default and fixed, so the Windows
         // port can rebuild this same logical document from the same literals and compare the
@@ -276,6 +245,39 @@ struct GoldenDump {
         let hsvAgainManifest = try Data(contentsOf: hsvAgain.appendingPathComponent("manifest.json"))
         print("004 second save byte-identical to the first: \(hsvAgainManifest == hsvManifest)")
         artifacts.append(try Self.write(hsvAgainManifest, to: "004-hsv-again.manifest.json", in: out))
+
+        // ---------------------------------------------------------------- package listing
+        // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
+        // filesystem to know what a golden contains. Paths are relative to the corpus root
+        // ("001-minimal.comp/manifest.json").
+        //
+        // This block has to come after every package is written, so it sits at the end rather than
+        // next to 002. Moving it back up makes the compiler reject the references below.
+        var listing: [[String: Any]] = []
+        for (name, package) in [("001-minimal.comp", comp),
+                                ("003-adjustments.comp", adjustComp),
+                                ("004-hsv.comp", hsvComp)] {
+            guard let walker = FileManager.default.enumerator(
+                at: package, includingPropertiesForKeys: [.fileSizeKey]) else { continue }
+            for case let url as URL in walker {
+                let rel = name + "/" + url.path.replacingOccurrences(of: package.path + "/", with: "")
+                let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+                guard values.isRegularFile == true else { continue }
+                let data = try Data(contentsOf: url)
+                listing.append([
+                    "path": rel,
+                    "bytes": values.fileSize ?? 0,
+                    "sha256": SHA256Hex.of(data),
+                ])
+            }
+        }
+        listing.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
+
+        let packages = ["001-minimal.comp", "003-adjustments.comp", "004-hsv.comp"]
+        let treeJSON = try JSONSerialization.data(
+            withJSONObject: ["root": "001-minimal.comp", "packages": packages, "files": listing],
+            options: [.prettyPrinted, .sortedKeys])
+        artifacts.append(try Self.write(treeJSON, to: "tree.json", in: out))
 
         // ---------------------------------------------------------------- metadata
         // Recorded because several of these are machine-dependent and must be known when
