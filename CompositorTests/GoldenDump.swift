@@ -1611,6 +1611,71 @@ struct GoldenDump {
                                             to: "018-lens.json", in: out))
         }
 
+        // ---------------------------------------------------------------- 019 Content-Aware Fill
+        //
+        // A direct kernel, but not a plain one: `content_fill` takes a source raster AND a selection mask,
+        // and it synthesizes the selected region out of the unselected pixels around it.
+        //
+        // It calls `next_random()`, which is why this case was worth checking before it was worth writing.
+        // A filter that pulls from an entropy source can never be reproduced. The seed is a hard-coded
+        // constant (`ContentFill.c:56`, `0x6d2b79f5`) and nothing feeds it a time or a device value, so the
+        // whole patch search is deterministic and the render is exactly reproducible. What looked like the
+        // obstacle is only more input to prepare.
+        //
+        // The selection is built here rather than loaded from a document: a `SelectionClip` is a rect plus a
+        // coverage image, and the coverage is an ordinary gray mask. Four shapes and positions, because the
+        // result depends on what surrounds the selection and not only on the selection itself - two
+        // different boxes over the same neighborhood should not come out the same.
+
+        if let raster = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            func coverage(_ box: CGRect, ellipse: Bool) throws -> CGImage {
+                let mask = try BrushRaster.context(width: rawWidth, height: rawHeight, mask: true)
+                mask.setFillColor(gray: 1, alpha: 1)
+                if ellipse { mask.fillEllipse(in: box) } else { mask.fill(box) }
+                guard let image = mask.makeImage() else { throw ExportError.render }
+                return image
+            }
+
+            func filled(_ box: CGRect, ellipse: Bool) throws -> CGImage {
+                let clip = SelectionClip(rect: CGRect(x: 0, y: 0, width: rawWidth, height: rawHeight),
+                                         coverage: try coverage(box, ellipse: ellipse))
+                return try PixelFilter.run(FilterJob(kind: .contentAwareFill, image: raster,
+                                                     settings: FilterSettings(),
+                                                     scale: 1, selection: clip, mapping: .identity))
+            }
+
+            do {
+                for (name, box, ellipse) in [("019-fill-rect.raw", CGRect(x: 10, y: 8, width: 12, height: 8), false),
+                                             ("019-fill-ellipse.raw", CGRect(x: 10, y: 8, width: 12, height: 8), true),
+                                             ("019-fill-corner.raw", CGRect(x: 2, y: 2, width: 10, height: 7), false),
+                                             ("019-fill-wide.raw", CGRect(x: 4, y: 9, width: 24, height: 6), false)] {
+                    let rendered = try filled(box, ellipse: ellipse)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                }
+            } catch {
+                print("019 ERROR: content-aware fill failed: \(error)")
+            }
+
+            // The input, so the C# side can hold a reference for "the fill changed the selected region"
+            // without having to rebuild the raster from the same closed form the exporter used.
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: raster),
+                                                         "019 input produced no bytes"),
+                                            to: "019-fill-input.raw", in: out))
+
+            let dump: [String: Any] = [
+                "width": rawWidth, "height": rawHeight,
+                "rect": [10, 8, 12, 8],
+                "ellipse": [10, 8, 12, 8],
+                "corner": [2, 2, 10, 7],
+                "wide": [4, 9, 24, 6],
+            ]
+            artifacts.append(try Self.write(try JSONSerialization.data(withJSONObject: dump,
+                                                                       options: [.prettyPrinted, .sortedKeys]),
+                                            to: "019-fill.json", in: out))
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
