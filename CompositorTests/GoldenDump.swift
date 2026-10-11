@@ -1557,6 +1557,60 @@ struct GoldenDump {
                                             to: "017-dither.json", in: out))
         }
 
+        // ---------------------------------------------------------------- 018 Lens Correction
+        //
+        // The third direct kernel, and the simplest of them: one double in, one pass out. Every
+        // destination pixel is written from the source by bilinear sampling, so - unlike `draw_lines`,
+        // which reads a color buffer it only partly clears - there is no uninitialized memory anywhere in
+        // this path and the render is exactly reproducible.
+        //
+        // `distortion` is the panel's -100...100, scaled by `lensStrength` (0.35) into the kernel's k.
+        // Positive straightens barrel and negative straightens pincushion, so both signs are rendered.
+        //
+        // At 0 the kernel is the identity, and that is worth its own artifact rather than being assumed:
+        // scale comes out 1, the sample lands exactly on the source pixel, and both of the far weights
+        // come out 0. So "0 reproduces the input" is a real check - it is the one setting where a wrong
+        // center, a wrong half-diagonal, or an off-by-half in the pixel-center convention would still
+        // have to come out right, and it pins the C# side against a reference instead of against its own
+        // input (which would pass even if both were wrong in the same way).
+
+        if let raster = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            func lensed(_ distortion: Double) throws -> CGImage {
+                var filter = FilterSettings()
+                filter.distortion = distortion
+                return try PixelFilter.run(FilterJob(kind: .lensCorrection, image: raster, settings: filter,
+                                                     scale: 1, selection: nil, mapping: .identity))
+            }
+
+            do {
+                for (name, distortion) in [("018-lens-barrel.raw", 60.0),
+                                           ("018-lens-pincushion.raw", -60.0),
+                                           ("018-lens-quarter.raw", 25.0),
+                                           ("018-lens-extreme.raw", 100.0),
+                                           ("018-lens-identity.raw", 0.0)] {
+                    let rendered = try lensed(distortion)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                }
+            } catch {
+                print("018 ERROR: lens correction failed: \(error)")
+            }
+
+            let dump: [String: Any] = [
+                "width": rawWidth, "height": rawHeight,
+                "strength": PixelFilter.lensStrength,
+                "barrel": 60.0,
+                "pincushion": -60.0,
+                "quarter": 25.0,
+                "extreme": 100.0,
+                "identity": 0.0,
+            ]
+            artifacts.append(try Self.write(try JSONSerialization.data(withJSONObject: dump,
+                                                                       options: [.prettyPrinted, .sortedKeys]),
+                                            to: "018-lens.json", in: out))
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
