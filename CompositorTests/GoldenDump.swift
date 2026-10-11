@@ -900,6 +900,88 @@ struct GoldenDump {
             print("010 ERROR: the clipping stack could not be rendered: \(error)")
         }
 
+        // ---------------------------------------------------------------- 011 camera raw
+        //
+        // Camera Raw is a pipeline of six stages that read each other in a fixed order
+        // (CameraRaw.swift:237-266): calibration, the basic grade, Curve and Color Mixer, Effects and
+        // Grain, Detail and Optics - with Geometry before all of them, because it changes where the
+        // pixels are rather than what they are.
+        //
+        // This dumps the basic grade, which is the stage everything else sits on. It is one kernel
+        // taking twelve numbers, and the two ways to get it wrong are both worth catching separately:
+        //
+        //   1. the GAINS. Temperature and tint are not passed through - they become per-channel
+        //      multipliers, and red and blue take the warm/cool swing in opposite directions while
+        //      green takes the magenta swing at twice their weight. On a neutral image every gain is 1
+        //      and a wrong sign is invisible, so the white-balance case below moves temperature and
+        //      tint on their own, with the tone curve untouched.
+        //   2. the TONE MAPPING. Exposure, contrast, highlights, shadows, whites and blacks interact;
+        //      the second case moves all of them at once over a full luminance ramp.
+        //
+        // The input is opaque on purpose. A grade on premultiplied pixels and a grade on straight
+        // pixels are the same operation only while alpha is 255, so an opaque input keeps this case
+        // about the grade rather than about which convention each side used.
+        let rawWidth = 32
+        let rawHeight = 24
+
+        if let rawInput = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rawInput),
+                                                         "011 input produced no bytes"),
+                                            to: "011-input.raw", in: out))
+
+            // White balance alone: the gains, with the tone curve left at neutral.
+            var balance = CameraRawSettings()
+            balance.temperature = 55
+            balance.tint = -30
+            balance.saturation = 25
+
+            // The full grade: every one of the twelve numbers the kernel takes.
+            var grade = CameraRawSettings()
+            grade.temperature = 42
+            grade.tint = -18
+            grade.exposure = 0.65
+            grade.contrast = 35
+            grade.highlights = -40
+            grade.shadows = 55
+            grade.whites = 20
+            grade.blacks = -15
+            grade.vibrance = 30
+            grade.saturation = -12
+
+            do {
+                let balanced = try balance.apply(rawInput)
+                artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: balanced),
+                                                             "011 white balance produced no bytes"),
+                                                to: "011-white-balance.raw", in: out))
+            } catch {
+                print("011 ERROR: white balance failed: \(error)")
+            }
+
+            do {
+                let graded = try grade.apply(rawInput)
+                artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: graded),
+                                                             "011 grade produced no bytes"),
+                                                to: "011-graded.raw", in: out))
+            } catch {
+                print("011 ERROR: the grade failed: \(error)")
+            }
+
+            artifacts.append(try Self.write(try JSONSerialization.data(withJSONObject: [
+                "width": rawWidth, "height": rawHeight,
+                "whiteBalance": ["temperature": balance.temperature, "tint": balance.tint,
+                                 "saturation": balance.saturation],
+                "grade": ["temperature": grade.temperature, "tint": grade.tint,
+                          "exposure": grade.exposure, "contrast": grade.contrast,
+                          "highlights": grade.highlights, "shadows": grade.shadows,
+                          "whites": grade.whites, "blacks": grade.blacks,
+                          "vibrance": grade.vibrance, "saturation": grade.saturation],
+                "gains": ["whiteBalance": [balance.gains.red, balance.gains.green, balance.gains.blue],
+                          "grade": [grade.gains.red, grade.gains.green, grade.gains.blue]],
+            ], options: [.prettyPrinted, .sortedKeys]), to: "011-camera-raw.json", in: out))
+        } else {
+            print("011 ERROR: could not build the input raster")
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
@@ -1093,6 +1175,33 @@ struct GoldenDump {
     ///
     /// Returned as raw bytes alongside the image because the mask is compared as coverage, not as color,
     /// and reading a gray image back through a color context would convert it.
+    /// The opaque raster the Camera Raw case grades: a luminance ramp with a color cast that varies
+    /// across it, so the gains and the tone mapping both have something to bite on.
+    static func rawRaster(width: Int, height: Int) -> CGImage? {
+        guard width > 1, height > 1 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            let down = Double(y) * 255 / Double(height - 1)
+            for x in 0..<width {
+                let across = Double(x) * 255 / Double(width - 1)
+                let luma = (across + down) / 2
+                let r = luma
+                let g = luma * 3 / 4 + across / 4
+                let b = luma / 2 + down / 2
+                let o = (y * width + x) * 4
+                bytes[o] = UInt8(max(0, min(255, r.rounded())))
+                bytes[o + 1] = UInt8(max(0, min(255, g.rounded())))
+                bytes[o + 2] = UInt8(max(0, min(255, b.rounded())))
+                bytes[o + 3] = 255
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
     static func stackMask(width: Int, height: Int) -> (image: CGImage, bytes: Data)? {
         var bytes = [UInt8](repeating: 0, count: width * height)
         for y in 0..<height {
