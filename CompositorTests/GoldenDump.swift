@@ -1772,7 +1772,13 @@ struct GoldenDump {
             "style": s.style.rawValue, "styleCode": Int(s.style.code),
             "pixelSize": s.pixelSize, "cellSize": s.cellSize, "angle": s.angle, "levels": s.levels,
             "diffusion": s.diffusion, "density": s.density, "contrast": s.contrast,
-            "lightOnDark": s.lightOnDark && s.style.drawsMarks,
+            // The value the kernel is actually handed, not the one that matters: Dither.swift passes
+            // `lightOnDark ? 1 : 0` with no regard for the style, and the kernel is what ignores it for the
+            // tonal styles. Dumping the gated value would record something the reference never passed, and
+            // a port built to match that record would be matching a fiction. `drawsMarks` is dumped beside
+            // it so a reader can tell where it can have any effect at all.
+            "lightOnDark": s.lightOnDark,
+            "drawsMarks": s.style.drawsMarks,
             "originalColors": s.colors == .original,
             "dark": [s.dark.red, s.dark.green, s.dark.blue],
             "light": [s.light.red, s.light.green, s.light.blue],
