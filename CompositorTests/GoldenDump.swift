@@ -485,16 +485,19 @@ struct GoldenDump {
         let stackHeight = 32
 
         // slug, raster variant, pixel size, origin, opacity, blend, masked
-        let exactStack: [(String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode, Bool)] = [
-            ("base", 0, stackWidth, stackHeight, 0, 0, 1.0, .normal, false),
-            ("multiply", 1, 16, 16, 8, 6, 0.6, .multiply, false),
-            ("screen", 2, 24, 18, 5, 10, 0.85, .screen, false),
-            ("masked", 3, 20, 14, 12, 4, 1.0, .normal, true),
+        // slug, raster variant, pixel size, origin, opacity, blend, masked, rotation in degrees.
+        // Rotation is carried by every entry, zero for the exact stack and 17 for the one rotated
+        // layer, so the two stacks have the same shape and the rotated one can simply be appended.
+        let exactStack: [(String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode, Bool, CGFloat)] = [
+            ("base", 0, stackWidth, stackHeight, 0, 0, 1.0, .normal, false, 0),
+            ("multiply", 1, 16, 16, 8, 6, 0.6, .multiply, false, 0),
+            ("screen", 2, 24, 18, 5, 10, 0.85, .screen, false, 0),
+            ("masked", 3, 20, 14, 12, 4, 1.0, .normal, true, 0),
         ]
-        let rotatedLayer = ("rotated", 1, 12, 12, CGFloat(26), CGFloat(18), 0.7, LayerBlendMode.normal, CGFloat(17))
+        let rotatedLayer = ("rotated", 1, 12, 12, CGFloat(26), CGFloat(18), 0.7, LayerBlendMode.normal, false, CGFloat(17))
 
         /// Builds a snapshot from a layer list, in the order the manifest stores them: bottom first.
-        func stackSnapshot(_ layers: [(String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode, Bool)])
+        func stackSnapshot(_ layers: [(String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode, Bool, CGFloat)])
             -> (ProjectSnapshot, [String: CGImage], [String: Data]) {
             var records: [ProjectLayerRecord] = []
             var images: [UUID: ImportedImage] = [:]
@@ -502,7 +505,7 @@ struct GoldenDump {
             var rasters: [String: CGImage] = [:]
             var maskBytes: [String: Data] = [:]
 
-            for (slug, variant, pixelWidth, pixelHeight, x, y, opacity, blend, masked) in layers {
+            for (slug, variant, pixelWidth, pixelHeight, x, y, opacity, blend, masked, rotation) in layers {
                 let id = UUID()
                 guard let raster = Self.stackRaster(width: pixelWidth, height: pixelHeight, variant: variant),
                       let thumbnail = Self.stackRaster(width: max(1, pixelWidth / 2), height: max(1, pixelHeight / 2),
@@ -514,7 +517,8 @@ struct GoldenDump {
                 records.append(ProjectLayerRecord(
                     id: id, name: slug, isVisible: true,
                     transform: LayerTransform(origin: CGPoint(x: x, y: y),
-                                              size: CGSize(width: pixelWidth, height: pixelHeight)),
+                                              size: CGSize(width: pixelWidth, height: pixelHeight),
+                                              rotation: rotation),
                     imageFile: "\(slug).png", opacity: opacity, blendMode: blend,
                     maskFile: masked ? "\(slug)-mask.png" : nil))
                 images[id] = ImportedImage(image: raster, thumbnail: thumbnail, name: slug)
@@ -564,17 +568,11 @@ struct GoldenDump {
 
             // The layer list, dumped rather than left implicit. The C# side rebuilds the same stack from
             // these numbers instead of hard-coding a second copy that could drift from this one.
-            var described: [[String: Any]] = []
-            for (slug, variant, pixelWidth, pixelHeight, x, y, opacity, blend, masked) in exactStack {
-                described.append(["slug": slug, "variant": variant, "pixelWidth": pixelWidth,
-                                  "pixelHeight": pixelHeight, "x": Double(x), "y": Double(y),
-                                  "opacity": opacity, "blend": blend.rawValue, "masked": masked,
-                                  "rotation": 0.0])
+            let described = (exactStack + [rotatedLayer]).map { layer -> [String: Any] in
+                ["slug": layer.0, "variant": layer.1, "pixelWidth": layer.2, "pixelHeight": layer.3,
+                 "x": Double(layer.4), "y": Double(layer.5), "opacity": layer.6,
+                 "blend": layer.7.rawValue, "masked": layer.8, "rotation": Double(layer.9)]
             }
-            let (rs, rv, rw, rh, rx, ry, rop, rb, _) = rotatedLayer
-            described.append(["slug": rs, "variant": rv, "pixelWidth": rw, "pixelHeight": rh,
-                              "x": Double(rx), "y": Double(ry), "opacity": rop, "blend": rb.rawValue,
-                              "masked": false, "rotation": 17.0])
             artifacts.append(try Self.write(try JSONSerialization.data(
                 withJSONObject: ["width": stackWidth, "height": stackHeight,
                                  "exactCount": exactStack.count, "layers": described],
