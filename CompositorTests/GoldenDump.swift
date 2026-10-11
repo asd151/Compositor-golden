@@ -356,6 +356,86 @@ struct GoldenDump {
             }
         }
 
+        // ---------------------------------------------------------------- 006 blend modes
+        //
+        // Case 005 covers the C kernels. This covers compositing, which no C file implements: the app
+        // hands the work to Core Graphics for the modes it can draw, and to Core Image for the eleven
+        // it cannot (LayerAppearance.swift:44-56 and SeparableBlend.swift).
+        //
+        // That makes these a different kind of reference from case 005, and worth stating plainly. The
+        // adjustment kernels are the port's own source compiled twice, so agreement there follows from
+        // the build once it is set up right. The blend modes are Apple's closed implementations against
+        // the port's own arithmetic, so agreement is a question rather than a formality - and the app's
+        // own comments predict part of the answer. Core Graphics' Soft Light "is up to 25 levels off
+        // Photoshop's with a light blend color (Core Image's is within 5)"; Color Burn and Color Dodge
+        // "ignore how transparent the source is, so a soft brush comes out with a hard edge"
+        // (SeparableBlend.swift:6-8). The port implements the Photoshop formulas, so for those modes a
+        // mismatch is the expected result and the useful output is knowing its size.
+        //
+        // Each mode is composited through the same dispatch the canvas uses, so what is dumped here is
+        // what the app draws rather than a restatement of it.
+        let blendSide = 24
+        let backdrop = try #require(Self.makeBlendRaster(side: blendSide, variant: 0, varyingAlpha: false),
+                                    "006 could not build the backdrop raster")
+        let blendOpaque = try #require(Self.makeBlendRaster(side: blendSide, variant: 1, varyingAlpha: false),
+                                       "006 could not build the opaque source raster")
+        let blendAlpha = try #require(Self.makeBlendRaster(side: blendSide, variant: 1, varyingAlpha: true),
+                                      "006 could not build the varying-alpha source raster")
+
+        artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: backdrop), "006 backdrop unreadable"),
+                                        to: "006-backdrop.raw", in: out))
+        artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: blendOpaque), "006 source unreadable"),
+                                        to: "006-source-opaque.raw", in: out))
+        artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: blendAlpha), "006 source-alpha unreadable"),
+                                        to: "006-source-alpha.raw", in: out))
+
+        let blendRect = CGRect(x: 0, y: 0, width: blendSide, height: blendSide)
+        for mode in LayerBlendMode.allCases {
+            let slug = Self.slug(mode.rawValue)
+
+            for (suffix, source) in [("opaque", blendOpaque), ("alpha", blendAlpha)] {
+                do {
+                    let context = try BrushRaster.context(width: blendSide, height: blendSide, mask: false)
+                    context.draw(backdrop, in: blendRect)
+
+                    if SeparableBlend.needsSurface(mode) {
+                        // The canvas route for the modes Core Graphics cannot draw.
+                        let drawn = SeparableBlend.draw(mode, in: context) { surface in
+                            surface.draw(source, in: blendRect)
+                        }
+                        if !drawn { print("006 ERROR: \(slug)/\(suffix) found no Core Image surface") }
+                    } else {
+                        context.saveGState()
+                        context.setBlendMode(mode.cgMode)
+                        context.setAlpha(1)
+                        context.draw(source, in: blendRect)
+                        context.restoreGState()
+                    }
+
+                    guard let image = context.makeImage(),
+                          let raw = Self.rgbaBytes(of: image) else {
+                        print("006 ERROR: \(slug)/\(suffix) produced no bytes")
+                        continue
+                    }
+                    artifacts.append(try Self.write(raw, to: "006-\(slug)-\(suffix).raw", in: out))
+                } catch {
+                    print("006 ERROR: \(slug)/\(suffix) failed: \(error)")
+                }
+            }
+        }
+        // The mode list is dumped rather than left implicit: the C# side must know which Core Image
+        // filter each one used, because that is what decides whether a mismatch is expected.
+        var modeIndex: [[String: Any]] = []
+        for mode in LayerBlendMode.allCases {
+            modeIndex.append(["slug": Self.slug(mode.rawValue),
+                              "name": mode.rawValue,
+                              "path": SeparableBlend.needsSurface(mode) ? "coreImage" : "coreGraphics",
+                              "filter": mode.coreImageFilter ?? ""])
+        }
+        artifacts.append(try Self.write(try JSONSerialization.data(withJSONObject: modeIndex,
+                                                                   options: [.prettyPrinted, .sortedKeys]),
+                                        to: "006-modes.json", in: out))
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
@@ -452,6 +532,65 @@ struct GoldenDump {
                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// The two rasters case 006 blends, built from a closed form for the same reason case 005's input is:
+    /// the C# side has to rebuild them from the same integer arithmetic, so a disagreement is about the
+    /// blend and not about the pixels that went into it.
+    ///
+    /// The two variants never share a channel's slope, so no channel of one can be mistaken for a channel
+    /// of the other, and every channel depends on both axes.
+    static func makeBlendRaster(side: Int, variant: Int, varyingAlpha: Bool) -> CGImage? {
+        var bytes = [UInt8](repeating: 0, count: side * side * 4)
+        for y in 0..<side {
+            for x in 0..<side {
+                let i = (y * side + x) * 4
+                var r: Int, g: Int, b: Int
+                if variant == 0 {
+                    r = (x * 11 + y * 7) % 256
+                    g = (x * 5 + y * 23) % 256
+                    b = (x * 19 + y * 13) % 256
+                } else {
+                    r = (x * 29 + y * 17) % 256
+                    g = (x * 3 + y * 31) % 256
+                    b = (x * 13 + y * 37) % 256
+                }
+                let a = varyingAlpha ? ((x * 9 + y * 21) % 256) : 255
+                if varyingAlpha {
+                    r = r * a / 255
+                    g = g * a / 255
+                    b = b * a / 255
+                }
+                bytes[i] = UInt8(r)
+                bytes[i + 1] = UInt8(g)
+                bytes[i + 2] = UInt8(b)
+                bytes[i + 3] = UInt8(a)
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: side, height: side, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: side * 4,
+                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// A file-name-safe form of a blend mode's name. "Linear Dodge (Add)" becomes "linear-dodge-add", so
+    /// the artifacts sort and read plainly and the C# side can match them against a list rather than
+    /// having to reproduce the punctuation.
+    static func slug(_ name: String) -> String {
+        var out = ""
+        var pendingDash = false
+        for ch in name.lowercased() {
+            if ch.isLetter || ch.isNumber {
+                if pendingDash && !out.isEmpty { out.append("-") }
+                out.append(ch)
+                pendingDash = false
+            } else {
+                pendingDash = true
+            }
+        }
+        return out
     }
 
     /// Reads an image back as premultiplied RGBA8, in the layout the port uses.
