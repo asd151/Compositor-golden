@@ -1392,6 +1392,171 @@ struct GoldenDump {
             ], options: [.prettyPrinted, .sortedKeys]), to: "015-vignette.json", in: out))
         }
 
+        // ---------------------------------------------------------------- 016 Scanlines
+        //
+        // A direct kernel over the whole raster, so every parameter the panel exposes can be pinned.
+        // Two things about it are worth stating because they shape what is dumped:
+        //
+        //   * `glow` is left at 0. Glow blurs the lines across a few spacings and adds them back, and that
+        //     blur is Core Image's - the same closed resampling filter that keeps rotated layers and blurs
+        //     out of reach. With glow off the render is the kernel alone, which IS reachable.
+        //   * `colors` has three settings and they take different branches inside the kernel: black and
+        //     white pass fixed endpoints, two colors pass the panel's own, and original keeps the image's
+        //     own colors. All three are dumped, because a port that wired up one branch and left the others
+        //     at their defaults would still match on the branch it did.
+
+        if let raster = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            func scanlines(_ settings: ScanlinesSettings) throws -> CGImage {
+                var filter = FilterSettings()
+                filter.scanlines = settings
+                return try PixelFilter.run(FilterJob(kind: .scanlines, image: raster, settings: filter,
+                                                     scale: 1, selection: nil, mapping: .identity))
+            }
+
+            // Every shape control moved off its default, so one render covers them together. The
+            // individual fields are dumped below as well, so a mismatch can be attributed to a field.
+            var shaped = ScanlinesSettings()
+            shaped.lineSpacing = 6
+            shaped.thickness = 45
+            shaped.glow = 0
+            shaped.dots = 55
+            shaped.wobble = 9
+            shaped.displace = -35
+            shaped.smoothness = 20
+            shaped.threshold = 30
+            shaped.split = 5
+            shaped.density = -20
+            shaped.contrast = 40
+            shaped.blackLevel = 25
+
+            // Two colors with a colored pair, and original colors, are separate branches.
+            var twoColor = shaped
+            twoColor.colors = .twoColors
+            twoColor.dark = AdjustmentColor(red: 0.08, green: 0.02, blue: 0.3)
+            twoColor.light = AdjustmentColor(red: 0.95, green: 0.7, blue: 0.2)
+
+            var original = shaped
+            original.colors = .original
+
+            // Displacement the other way, with the lines wide apart and almost solid, which is the case
+            // where the line shape rather than the displacement dominates.
+            var wide = ScanlinesSettings()
+            wide.lineSpacing = 18
+            wide.thickness = 95
+            wide.dots = 0
+            wide.displace = 45
+            wide.smoothness = 80
+            wide.split = 12
+            wide.blackLevel = 60
+
+            do {
+                for (name, settings) in [("016-scanlines-shaped.raw", shaped),
+                                         ("016-scanlines-two-color.raw", twoColor),
+                                         ("016-scanlines-original.raw", original),
+                                         ("016-scanlines-wide.raw", wide)] {
+                    let rendered = try scanlines(settings)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                }
+            } catch {
+                print("016 ERROR: scanlines failed: \(error)")
+            }
+
+            let dump: [String: Any] = [
+                "width": rawWidth, "height": rawHeight,
+                "shaped": Self.scanlineFields(shaped),
+                "twoColor": Self.scanlineFields(twoColor),
+                "original": Self.scanlineFields(original),
+                "wide": Self.scanlineFields(wide),
+            ]
+            artifacts.append(try Self.write(try JSONSerialization.data(withJSONObject: dump,
+                                                                       options: [.prettyPrinted, .sortedKeys]),
+                                            to: "016-scanlines.json", in: out))
+        }
+
+        // ---------------------------------------------------------------- 017 Dither
+        //
+        // Also a direct kernel. The one thing that makes it reachable is `pixelSize`: above 1, the app
+        // averages the image down with Core Graphics first (interpolationQuality .high) and blows it back
+        // up, and that resampling is closed - it is the same limitation as a rotated layer. At 1 there is
+        // no such step and the kernel runs on the image as it is.
+        //
+        // ASCII is the one style that needs glyphs - CoreText rasterizes them and the kernel is handed the
+        // coverage maps - so it is left to its own case. Every other style needs no glyph data at all.
+        //
+        // The styles take genuinely different paths inside the kernel: error diffusion walks the image
+        // passing error along, the Bayer styles use ordered thresholds, and the halftone and pattern
+        // styles draw marks. Each group gets a render, plus `original` colors and a non-default cell size.
+
+        if let raster = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            func dithered(_ settings: DitherSettings) throws -> CGImage {
+                var filter = FilterSettings()
+                filter.dither = settings
+                return try PixelFilter.run(FilterJob(kind: .dither, image: raster, settings: filter,
+                                                     scale: 1, selection: nil, mapping: .identity))
+            }
+
+            // pixelSize stays 1 throughout: that is what keeps Core Graphics out of the path.
+            var ordered = DitherSettings()
+            ordered.style = .bayer4
+            ordered.pixelSize = 1
+            ordered.levels = 3
+            ordered.density = -25
+            ordered.contrast = 45
+
+            var diffused = DitherSettings()
+            diffused.style = .floydSteinberg       // Atkinson is the default; this is its sibling
+            diffused.pixelSize = 1
+            diffused.diffusion = 60
+            diffused.density = 30
+
+            var halftone = DitherSettings()
+            halftone.style = .dots
+            halftone.pixelSize = 1
+            halftone.cellSize = 6
+            halftone.angle = 20
+            halftone.lightOnDark = false
+
+            var patterns = DitherSettings()
+            patterns.style = .patterns
+            patterns.pixelSize = 1
+            patterns.cellSize = 4
+
+            var originalColors = DitherSettings()
+            originalColors.style = .bayer8
+            originalColors.pixelSize = 1
+            originalColors.colors = .original
+            originalColors.levels = 5
+
+            do {
+                for (name, settings) in [("017-dither-bayer4.raw", ordered),
+                                         ("017-dither-floyd.raw", diffused),
+                                         ("017-dither-dots.raw", halftone),
+                                         ("017-dither-patterns.raw", patterns),
+                                         ("017-dither-original.raw", originalColors)] {
+                    let rendered = try dithered(settings)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                }
+            } catch {
+                print("017 ERROR: dither failed: \(error)")
+            }
+
+            let dump: [String: Any] = [
+                "width": rawWidth, "height": rawHeight,
+                "bayer4": Self.ditherFields(ordered),
+                "floyd": Self.ditherFields(diffused),
+                "dots": Self.ditherFields(halftone),
+                "patterns": Self.ditherFields(patterns),
+                "original": Self.ditherFields(originalColors),
+            ]
+            artifacts.append(try Self.write(try JSONSerialization.data(withJSONObject: dump,
+                                                                       options: [.prettyPrinted, .sortedKeys]),
+                                            to: "017-dither.json", in: out))
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
@@ -1585,6 +1750,35 @@ struct GoldenDump {
     ///
     /// Returned as raw bytes alongside the image because the mask is compared as coverage, not as color,
     /// and reading a gray image back through a color context would convert it.
+    /// The Scanlines settings the way they reach the kernel, after `normalized` has rounded and clamped
+    /// them. Dumped from the normalized value rather than the raw one, because that is what the kernel is
+    /// handed and a port that clamped differently would otherwise look like a kernel mismatch.
+    static func scanlineFields(_ settings: ScanlinesSettings) -> [String: Any] {
+        let s = settings.normalized
+        return [
+            "lineSpacing": s.lineSpacing, "thickness": s.thickness, "glow": s.glow, "dots": s.dots,
+            "wobble": s.wobble, "displace": s.displace, "smoothness": s.smoothness,
+            "threshold": s.threshold, "split": s.split, "density": s.density, "contrast": s.contrast,
+            "blackLevel": s.blackLevel, "colors": s.colors.rawValue,
+            "dark": [s.dark.red, s.dark.green, s.dark.blue],
+            "light": [s.light.red, s.light.green, s.light.blue],
+        ]
+    }
+
+    /// The Dither settings the way they reach the kernel, after `normalized`.
+    static func ditherFields(_ settings: DitherSettings) -> [String: Any] {
+        let s = settings.normalized
+        return [
+            "style": s.style.rawValue, "styleCode": Int(s.style.code),
+            "pixelSize": s.pixelSize, "cellSize": s.cellSize, "angle": s.angle, "levels": s.levels,
+            "diffusion": s.diffusion, "density": s.density, "contrast": s.contrast,
+            "lightOnDark": s.lightOnDark && s.style.drawsMarks,
+            "originalColors": s.colors == .original,
+            "dark": [s.dark.red, s.dark.green, s.dark.blue],
+            "light": [s.light.red, s.light.green, s.light.blue],
+        ]
+    }
+
     /// A raster with genuinely transparent pixels, for the vignette's fillsClear path: alpha ramps in
     /// from nothing across the left third, and the color is stored premultiplied so the invariant
     /// c <= a holds everywhere.
