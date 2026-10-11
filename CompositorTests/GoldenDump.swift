@@ -305,6 +305,33 @@ struct GoldenDump {
         artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: alphaInput), "005 round trip 2 failed"),
                                         to: "005-roundtrip-alpha.raw", in: out))
 
+        // What the kernel actually receives.
+        //
+        // The adjustment routines do not run on the image that was handed in: every one of them goes
+        // through ImageAdjustmentPixels.run, which draws the image into a BrushRaster context and runs
+        // the kernel on that buffer (ImageAdjustments.swift:100-108). That context is flipped
+        // (BrushStroke.swift:40-41), and BrushRaster.draw only takes its byte-copy fast path when the
+        // image's bitmapInfo matches the context's exactly - otherwise it rasterizes.
+        //
+        // So the pixels the kernel sees are not necessarily the pixels that went in. Dumping them
+        // separates the two: if this differs from the input, a mismatch on the C# side is that draw,
+        // not the adjustment, and blaming the renderer would be wrong.
+        for (suffix, input) in [("opaque", opaqueInput), ("alpha", alphaInput)] {
+            do {
+                let probe = try BrushRaster.context(width: pixelSide, height: pixelSide, mask: false)
+                BrushRaster.draw(input, in: CGRect(x: 0, y: 0, width: pixelSide, height: pixelSide),
+                                 mask: false, context: probe)
+                guard let data = probe.data else {
+                    print("005 ERROR: the \(suffix) kernel-input context had no buffer")
+                    continue
+                }
+                let buffer = Data(bytes: data, count: pixelSide * pixelSide * 4)
+                artifacts.append(try Self.write(buffer, to: "005-kernelinput-\(suffix).raw", in: out))
+            } catch {
+                print("005 ERROR: could not capture the \(suffix) kernel input: \(error)")
+            }
+        }
+
         let pixelEncoder = JSONEncoder()
         pixelEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
 
