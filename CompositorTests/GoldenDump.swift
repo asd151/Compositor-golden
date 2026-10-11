@@ -1628,16 +1628,29 @@ struct GoldenDump {
         // different boxes over the same neighborhood should not come out the same.
 
         if let raster = Self.rawRaster(width: rawWidth, height: rawHeight) {
-            // The coverage is dumped alongside the render, and that is not belt-and-braces: `fillEllipse`
-            // antialiases its edge, so the mask the kernel actually sees is Core Graphics' own rasterization
-            // and cannot be rebuilt from the box. Handing the bytes over as input is what keeps the kernel
-            // verifiable instead of tying it to the rasterizer - the same move as ASCII dither's glyph
-            // coverage maps. The rect variants would rebuild exactly; the ellipse would not.
+            // The coverage is dumped alongside the render, and getting the right bytes here took a second
+            // pass. The coverage IMAGE is not what the kernel sees: `ContentFill.run` applies it through
+            // `SelectionClip.apply`, which does `clip(to:mask:)`, and **clipping to a mask resamples it**.
+            // For a hard-edged rect on whole pixels that resampling is the identity; for an antialiased
+            // ellipse it is not. Dumping the coverage directly recorded an artifact the kernel never
+            // received - and the tell was that exactly the three hard-edged cases matched while the soft
+            // one did not, which is the signature of a resampled edge rather than of a wrong kernel.
+            //
+            // So this reproduces `ContentFill.run`'s own mask construction and dumps THAT.
             func coverage(_ box: CGRect, ellipse: Bool) throws -> (image: CGImage, bytes: Data) {
-                let mask = try BrushRaster.context(width: rawWidth, height: rawHeight, mask: true)
-                mask.setFillColor(gray: 1, alpha: 1)
-                if ellipse { mask.fillEllipse(in: box) } else { mask.fill(box) }
-                guard let image = mask.makeImage(), let raw = mask.data else { throw ExportError.render }
+                let shape = try BrushRaster.context(width: rawWidth, height: rawHeight, mask: true)
+                shape.setFillColor(gray: 1, alpha: 1)
+                if ellipse { shape.fillEllipse(in: box) } else { shape.fill(box) }
+                guard let image = shape.makeImage() else { throw ExportError.render }
+
+                let extent = CGRect(x: 0, y: 0, width: rawWidth, height: rawHeight)
+                let applied = try BrushRaster.context(width: rawWidth, height: rawHeight, mask: true)
+                applied.saveGState()
+                SelectionClip(rect: extent, coverage: image).apply(to: applied)
+                applied.setFillColor(gray: 1, alpha: 1)
+                applied.fill(extent)
+                applied.restoreGState()
+                guard let raw = applied.data else { throw ExportError.render }
                 return (image, Data(bytes: raw, count: rawWidth * rawHeight))
             }
 
