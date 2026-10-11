@@ -1310,6 +1310,88 @@ struct GoldenDump {
             }
         }
 
+        // ---------------------------------------------------------------- 015 the standalone Vignette
+        //
+        // A different filter from the vignette inside Camera Raw, and it does not share its defaults. The
+        // load-bearing difference is Roundness: 100 here against 0 there. A port that carried one set of
+        // defaults across to the other would be wrong on every document that never touched the slider,
+        // which is most of them.
+        //
+        // It is also the one filter that can run on an EMPTY layer: with no pixels to begin with it
+        // frames the canvas and fills it, which is what `fillsClear` asks the kernel for. Both are
+        // dumped, because a port that passed it unconditionally would paint over transparent pixels on
+        // an ordinary layer.
+        //
+        // The frame is the vignette's shape rather than the raster's size, so a CANVAS smaller than the
+        // layer is dumped too - that is the case a port that ignored the frame would still pass on the
+        // full-frame renders. And it is the canvas that turns fillsClear on, so that render also covers
+        // the transparent-pixel path.
+
+        if let raster = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            var vig = FilterSettings()
+            vig.vignetteAmount = 70
+            vig.vignetteColor = AdjustmentColor(red: 0.15, green: 0.05, blue: 0.35)
+            vig.vignetteMidpoint = 40
+            vig.vignetteRoundness = -30
+            vig.vignetteFeather = 35
+            vig.vignetteHighlights = 60
+
+            // Through PixelFilter.run rather than the kernel, so the case covers the frame derivation and
+            // the fillsClear decision as well as the falloff itself.
+            func run(_ source: CGImage, _ settings: FilterSettings, canvas: CGRect?) throws -> CGImage {
+                try PixelFilter.run(FilterJob(kind: .vignette, image: source, settings: settings,
+                                              scale: 1, selection: nil, mapping: .identity, canvas: canvas))
+            }
+
+            do {
+                // An ordinary layer: no canvas, so the vignette frames the layer's own pixels and only
+                // recolors the ones that are there.
+                let full = try run(raster, vig, canvas: nil)
+                artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: full),
+                                                             "015 vignette produced no bytes"),
+                                                to: "015-vignette.raw", in: out))
+
+                // A canvas smaller than the layer, inset and centered by the mapping: a different frame
+                // AND fillsClear on, so transparent pixels get painted where the frame reaches them.
+                if let clearRaster = Self.vignetteClearRaster(width: rawWidth, height: rawHeight) {
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: clearRaster),
+                                                                 "015 clear input produced no bytes"),
+                                                    to: "015-clear-input.raw", in: out))
+                    let insetCanvas = CGRect(x: CGFloat(rawWidth) * 0.25, y: CGFloat(rawHeight) * 0.2,
+                                             width: CGFloat(rawWidth) * 0.5, height: CGFloat(rawHeight) * 0.5)
+                    let cleared = try run(clearRaster, vig, canvas: insetCanvas)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: cleared),
+                                                                 "015 canvas vignette produced no bytes"),
+                                                    to: "015-vignette-canvas.raw", in: out))
+                }
+
+                // The same frame but the OTHER direction: roundness positive, highlights off, a light
+                // edge color. Roundness defaults to 100 here against 0 in Camera Raw, so both signs of it
+                // are worth pinning down rather than just the default.
+                var light = vig
+                light.vignetteAmount = 55
+                light.vignetteColor = AdjustmentColor(red: 0.95, green: 0.9, blue: 0.7)
+                light.vignetteRoundness = 100
+                light.vignetteHighlights = 0
+                light.vignetteMidpoint = 65
+                light.vignetteFeather = 80
+                let bright = try run(raster, light, canvas: nil)
+                artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: bright),
+                                                             "015 bright vignette produced no bytes"),
+                                                to: "015-vignette-bright.raw", in: out))
+            } catch {
+                print("015 ERROR: the vignette failed: \(error)")
+            }
+
+            artifacts.append(try Self.write(try JSONSerialization.data(withJSONObject: [
+                "width": rawWidth, "height": rawHeight,
+                "amount": vig.vignetteAmount, "midpoint": vig.vignetteMidpoint,
+                "roundness": vig.vignetteRoundness, "feather": vig.vignetteFeather,
+                "highlights": vig.vignetteHighlights,
+                "color": [vig.vignetteColor.red, vig.vignetteColor.green, vig.vignetteColor.blue],
+            ], options: [.prettyPrinted, .sortedKeys]), to: "015-vignette.json", in: out))
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
@@ -1503,6 +1585,34 @@ struct GoldenDump {
     ///
     /// Returned as raw bytes alongside the image because the mask is compared as coverage, not as color,
     /// and reading a gray image back through a color context would convert it.
+    /// A raster with genuinely transparent pixels, for the vignette's fillsClear path: alpha ramps in
+    /// from nothing across the left third, and the color is stored premultiplied so the invariant
+    /// c <= a holds everywhere.
+    static func vignetteClearRaster(width: Int, height: Int) -> CGImage? {
+        guard width > 1, height > 1 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        let rampEnd = max(1, width / 3)
+        for y in 0..<height {
+            for x in 0..<width {
+                let alpha = x >= rampEnd ? 255.0 : 255.0 * Double(x) / Double(rampEnd)
+                let base = 40.0 + (Double(x) / Double(width - 1)) * 180.0
+                let other = 30.0 + (Double(y) / Double(height - 1)) * 200.0
+                let scale = alpha / 255.0
+                let o = (y * width + x) * 4
+                bytes[o] = UInt8(max(0, min(255, (base * scale).rounded())))
+                bytes[o + 1] = UInt8(max(0, min(255, (other * scale).rounded())))
+                bytes[o + 2] = UInt8(max(0, min(255, (((base + other) / 2) * scale).rounded())))
+                bytes[o + 3] = UInt8(max(0, min(255, alpha.rounded())))
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: space,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
     /// The opaque raster the Camera Raw case grades: a luminance ramp with a color cast that varies
     /// across it, so the gains and the tone mapping both have something to bite on.
     static func rawRaster(width: Int, height: Int) -> CGImage? {
