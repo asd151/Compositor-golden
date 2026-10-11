@@ -1628,20 +1628,27 @@ struct GoldenDump {
         // different boxes over the same neighborhood should not come out the same.
 
         if let raster = Self.rawRaster(width: rawWidth, height: rawHeight) {
-            func coverage(_ box: CGRect, ellipse: Bool) throws -> CGImage {
+            // The coverage is dumped alongside the render, and that is not belt-and-braces: `fillEllipse`
+            // antialiases its edge, so the mask the kernel actually sees is Core Graphics' own rasterization
+            // and cannot be rebuilt from the box. Handing the bytes over as input is what keeps the kernel
+            // verifiable instead of tying it to the rasterizer - the same move as ASCII dither's glyph
+            // coverage maps. The rect variants would rebuild exactly; the ellipse would not.
+            func coverage(_ box: CGRect, ellipse: Bool) throws -> (image: CGImage, bytes: Data) {
                 let mask = try BrushRaster.context(width: rawWidth, height: rawHeight, mask: true)
                 mask.setFillColor(gray: 1, alpha: 1)
                 if ellipse { mask.fillEllipse(in: box) } else { mask.fill(box) }
-                guard let image = mask.makeImage() else { throw ExportError.render }
-                return image
+                guard let image = mask.makeImage(), let raw = mask.data else { throw ExportError.render }
+                return (image, Data(bytes: raw, count: rawWidth * rawHeight))
             }
 
-            func filled(_ box: CGRect, ellipse: Bool) throws -> CGImage {
+            func filled(_ box: CGRect, ellipse: Bool) throws -> (image: CGImage, mask: Data) {
+                let marks = try coverage(box, ellipse: ellipse)
                 let clip = SelectionClip(rect: CGRect(x: 0, y: 0, width: rawWidth, height: rawHeight),
-                                         coverage: try coverage(box, ellipse: ellipse))
-                return try PixelFilter.run(FilterJob(kind: .contentAwareFill, image: raster,
-                                                     settings: FilterSettings(),
-                                                     scale: 1, selection: clip, mapping: .identity))
+                                         coverage: marks.image)
+                let image = try PixelFilter.run(FilterJob(kind: .contentAwareFill, image: raster,
+                                                          settings: FilterSettings(),
+                                                          scale: 1, selection: clip, mapping: .identity))
+                return (image, marks.bytes)
             }
 
             do {
@@ -1649,10 +1656,13 @@ struct GoldenDump {
                                              ("019-fill-ellipse.raw", CGRect(x: 10, y: 8, width: 12, height: 8), true),
                                              ("019-fill-corner.raw", CGRect(x: 2, y: 2, width: 10, height: 7), false),
                                              ("019-fill-wide.raw", CGRect(x: 4, y: 9, width: 24, height: 6), false)] {
-                    let rendered = try filled(box, ellipse: ellipse)
+                    let (rendered, marks) = try filled(box, ellipse: ellipse)
                     artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
                                                                  "\(name) produced no bytes"),
                                                     to: name, in: out))
+                    artifacts.append(try Self.write(marks,
+                                                    to: name.replacingOccurrences(of: "fill", with: "mask"),
+                                                    in: out))
                 }
             } catch {
                 print("019 ERROR: content-aware fill failed: \(error)")
