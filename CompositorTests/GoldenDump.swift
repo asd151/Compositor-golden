@@ -1088,6 +1088,92 @@ struct GoldenDump {
             }
         }
 
+        // ---------------------------------------------------------------- 013 camera raw Detail and Optics
+        //
+        // The last two stages, and the only ones that are spatially shaped rather than pointwise: they
+        // read neighbouring pixels, which is why `scale` matters and why their radii are measured in
+        // pixels of the layer rather than of the preview.
+        //
+        // Detail and Optics run in that order - Optics first - even though they are dumped as one group
+        // here. Sharpening the lens distortion's output is not the same as distorting the sharpening's.
+        //
+        // Optics is also the stage with a computed input rather than a passed-through one: the radial
+        // distortion the kernel takes is the manual amount and the profile amount ADDED, each scaled by
+        // the lens strength, and the profile term only counts while the profile toggle is on - so a port
+        // that ignored the toggle would still get the default profile amount of 100 into the sum.
+
+        if let rawInput = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            // Detail alone: sharpening and both noise reductions.
+            var detail = CameraRawSettings()
+            detail.detail.sharpenAmount = 90
+            detail.detail.sharpenRadius = 30
+            detail.detail.sharpenDetail = 60
+            detail.detail.sharpenMasking = 20
+            detail.detail.noiseLuminance = 45
+            detail.detail.noiseLuminanceDetail = 65
+            detail.detail.noiseLuminanceContrast = 15
+            detail.detail.noiseColor = 55
+            detail.detail.noiseColorDetail = 35
+            detail.detail.noiseColorSmoothness = 70
+
+            // Optics alone, with the profile toggle ON so the profile terms reach the sum.
+            var opticsOn = CameraRawSettings()
+            opticsOn.optics.removeChromaticAberration = true
+            opticsOn.optics.enableLensProfile = true
+            opticsOn.optics.profileDistortion = 80
+            opticsOn.optics.profileVignetting = 60
+            opticsOn.optics.distortion = -40
+            opticsOn.optics.purpleAmount = 50
+            opticsOn.optics.purpleHueLow = 260
+            opticsOn.optics.purpleHueHigh = 320
+            opticsOn.optics.greenAmount = 35
+            opticsOn.optics.greenHueLow = 70
+            opticsOn.optics.greenHueHigh = 140
+            opticsOn.optics.vignetteAmount = 45
+            opticsOn.optics.vignetteMidpoint = 30
+
+            // The same optics with the profile toggle OFF. The profile amounts are still at their
+            // non-zero defaults, so a port that added them unconditionally would make these two match.
+            var opticsOff = opticsOn
+            opticsOff.optics.enableLensProfile = false
+
+            // Optics and Detail together, in the order the pipeline runs them.
+            var both = opticsOn
+            both.detail = detail.detail
+
+            let renders: [(String, CameraRawSettings, CGFloat, UInt32)] = [
+                ("013-detail.raw", detail, 1, 0),
+                ("013-optics-profile.raw", opticsOn, 1, 0),
+                ("013-optics-no-profile.raw", opticsOff, 1, 0),
+                ("013-optics-scaled.raw", opticsOn, 2, 0),
+                ("013-detail-optics.raw", both, 1, 0),
+            ]
+            for (name, settings, renderScale, renderSeed) in renders {
+                do {
+                    let rendered = try settings.apply(rawInput, scale: renderScale, seed: renderSeed)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                } catch {
+                    print("013 ERROR: \(name) failed: \(error)")
+                }
+            }
+
+            // The mask preview, which replaces the last stage rather than following it and leaves the
+            // basic grade in place.
+            var masked = CameraRawSettings()
+            masked.exposure = 0.4
+            masked.detail = detail.detail
+            do {
+                let rendered = try masked.apply(rawInput, sharpenMask: true)
+                artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                             "013 mask produced no bytes"),
+                                                to: "013-sharpen-mask.raw", in: out))
+            } catch {
+                print("013 ERROR: the sharpen mask failed: \(error)")
+            }
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
