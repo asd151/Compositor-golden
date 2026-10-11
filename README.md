@@ -37,7 +37,9 @@ Output lands in `golden-out/` at the repository root (override with `GOLDEN_DUMP
 |---|---|
 | `001-minimal.manifest.json` | Raw `manifest.json` bytes: indentation, spacing around `:`, and how `/` and non-ASCII are escaped. The layer name deliberately contains both. |
 | `002-resave.manifest.json` | Whether save → load → save reproduces identical bytes. If it does not, no byte-exact golden is trustworthy until that is understood. |
-| `tree.json` | Sorted path / size / SHA-256 for every file in the package, so a consumer never has to enumerate a filesystem to know what a golden contains. |
+| `003-adjustments.manifest.json` | One layer per adjustment kind with non-default settings: the adjustment key names, which optional members are omitted, and how whole doubles and `UInt32` seeds are written. Every value is a fixed literal, so the port can rebuild the same logical document and compare byte for byte. |
+| `004-hsv.manifest.json` | What the unstable `hsvSettings` dictionaries looked like in this run, saved twice to show whether even a single process repeats its own order. Compare semantically; see below. |
+| `tree.json` | Sorted path / size / SHA-256 for every file in each package, so a consumer never has to enumerate a filesystem to know what a golden contains. |
 | `metadata.json` | Manifest version, supported version range, macOS version, physical memory. Several limits are machine-dependent, so a diff is only meaningful alongside this. |
 
 ## Things that will bite you

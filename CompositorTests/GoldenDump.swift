@@ -111,9 +111,15 @@ struct GoldenDump {
         // A sorted name/size/SHA256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains.
         var listing: [[String: Any]] = []
-        if let walker = FileManager.default.enumerator(at: comp, includingPropertiesForKeys: [.fileSizeKey]) {
+        // Every package, so the C# harness never has to enumerate a filesystem to know what a golden
+        // contains. Paths are relative to the corpus root ("001-minimal.comp/manifest.json").
+        for (name, package) in [("001-minimal.comp", comp),
+                                ("003-adjustments.comp", adjustComp),
+                                ("004-hsv.comp", hsvComp)] {
+            guard let walker = FileManager.default.enumerator(
+                at: package, includingPropertiesForKeys: [.fileSizeKey]) else { continue }
             for case let url as URL in walker {
-                let rel = url.path.replacingOccurrences(of: comp.path + "/", with: "")
+                let rel = name + "/" + url.path.replacingOccurrences(of: package.path + "/", with: "")
                 let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
                 guard values.isRegularFile == true else { continue }
                 let data = try Data(contentsOf: url)
@@ -126,10 +132,150 @@ struct GoldenDump {
         }
         listing.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
 
+        let packages = ["001-minimal.comp", "003-adjustments.comp", "004-hsv.comp"]
         let treeJSON = try JSONSerialization.data(
-            withJSONObject: ["root": "001-minimal.comp", "files": listing],
+            withJSONObject: ["root": "001-minimal.comp", "packages": packages, "files": listing],
             options: [.prettyPrinted, .sortedKeys])
         artifacts.append(try Self.write(treeJSON, to: "tree.json", in: out))
+
+        // ---------------------------------------------------------------- 003 adjustments
+        // One adjustment layer per kind, with every setting non-default and fixed, so the Windows
+        // port can rebuild this same logical document from the same literals and compare the
+        // adjustment subtrees byte for byte.
+        //
+        // Nothing here may be random. addAdjustment() seeds Grain and Add Noise from the system RNG
+        // and gives a new Gradient Map the current foreground and background colors, so all three
+        // are overwritten with literals below. A case whose bytes cannot be predicted twice over is
+        // not a golden, it is a fingerprint of the machine that made it.
+        let adjust = EditorSession()
+        adjust.createDocument(width: 4, height: 4, resolution: 300)
+        adjust.addBlankLayer()
+
+        func setAdjustment(_ kind: AdjustmentKind, _ mutate: (inout LayerAdjustment) -> Void) {
+            adjust.addAdjustment(kind)
+            guard let id = adjust.projectSnapshot()?.manifest.layers.last?.id else {
+                print("003 ERROR: \(kind.rawValue) was not added")
+                return
+            }
+            var value = LayerAdjustment(kind: kind)
+            mutate(&value)
+            // updateAdjustment refuses an invalid value silently, which would leave the layer on its
+            // defaults and quietly weaken the artifact, so say so in the log instead.
+            guard value.isValid else {
+                print("003 ERROR: \(kind.rawValue) is not valid, so updateAdjustment will refuse it")
+                return
+            }
+            adjust.updateAdjustment(id, value: value)
+            if adjust.projectSnapshot()?.manifest.layers.last?.adjustment?.isValid != true {
+                print("003 ERROR: \(kind.rawValue) did not take")
+            }
+        }
+
+        setAdjustment(.hsv) {
+            $0.hue = 30; $0.saturation = 40; $0.lightness = -20; $0.colorize = true
+        }
+        setAdjustment(.levels) {
+            $0.levels.ranges = [
+                LevelRange(black: 10, gamma: 1.5, white: 240, outputBlack: 5, outputWhite: 250),
+                LevelRange(black: 0, gamma: 1, white: 255, outputBlack: 0, outputWhite: 255),
+                LevelRange(black: 20, gamma: 0.8, white: 200, outputBlack: 10, outputWhite: 220),
+                LevelRange(black: 5, gamma: 2, white: 250, outputBlack: 0, outputWhite: 255),
+            ]
+        }
+        setAdjustment(.curves) {
+            $0.curves.channels[1] = [CurvePoint(x: 0, y: 0), CurvePoint(x: 128, y: 200),
+                                     CurvePoint(x: 255, y: 255)]
+            $0.curves.channels[3] = [CurvePoint(x: 0, y: 10), CurvePoint(x: 64, y: 30),
+                                     CurvePoint(x: 192, y: 240), CurvePoint(x: 255, y: 250)]
+        }
+        setAdjustment(.exposure) {
+            $0.exposure = ExposureSettings(exposure: 1.5, offset: -0.25, gamma: 2.2)
+        }
+        setAdjustment(.gradientMap) {
+            $0.gradientMap = GradientMapSettings(
+                shadows: AdjustmentColor(red: 0.1, green: 0.2, blue: 0.3),
+                highlights: AdjustmentColor(red: 0.9, green: 0.8, blue: 0.7),
+                reversed: true)
+        }
+        setAdjustment(.grain) {
+            $0.grain = GrainSettings(amount: 30, size: 2.5, roughness: 60, seed: 123456)
+        }
+        setAdjustment(.addNoise) {
+            $0.resolvedNoiseAmount = 15
+            $0.resolvedNoiseGaussian = true
+            $0.resolvedNoiseMonochromatic = true
+            $0.resolvedNoiseSeed = 654321
+        }
+        setAdjustment(.gaussianBlur) { $0.gaussianRadius = 8.5 }
+        setAdjustment(.motionBlur) {
+            $0.resolvedMotionAngle = -45; $0.resolvedMotionDistance = 100
+        }
+        // Invert carries no settings at all, so this layer is the control case: it must emit the
+        // same key set as a default adjustment of any kind.
+        setAdjustment(.invert) { _ in }
+        setAdjustment(.blackWhite) {
+            $0.blackWhite = BlackWhiteSettings(reds: 45, yellows: 65, greens: 35, cyans: 55,
+                                               blues: 25, magentas: 85, tint: true, tintHue: 200,
+                                               tintSaturation: 15)
+        }
+        setAdjustment(.colorBalance) {
+            $0.colorBalance = ColorBalanceSettings(
+                shadowCyanRed: 10, shadowMagentaGreen: -20, shadowYellowBlue: 30,
+                midCyanRed: -5, midMagentaGreen: 15, midYellowBlue: -25,
+                highlightCyanRed: 20, highlightMagentaGreen: 5, highlightYellowBlue: -10,
+                preserveLuminosity: false)
+        }
+
+        let adjustSnapshot = try #require(adjust.projectSnapshot(), "adjustment session produced no snapshot")
+        print("003 kinds: \(adjustSnapshot.manifest.layers.compactMap { $0.adjustment?.kind.rawValue })")
+        let adjustComp = out.appendingPathComponent("003-adjustments.comp", isDirectory: true)
+        try await ProjectStore.shared.save(adjustSnapshot, to: adjustComp)
+        let adjustManifest = try Data(contentsOf: adjustComp.appendingPathComponent("manifest.json"))
+        print("=== BEGIN 003-adjustments.manifest.json (\(adjustManifest.count) bytes) ===")
+        print(String(decoding: adjustManifest, as: UTF8.self))
+        print("=== END 003-adjustments.manifest.json ===")
+        artifacts.append(try Self.write(adjustManifest, to: "003-adjustments.manifest.json", in: out))
+
+        // ---------------------------------------------------------------- 004 HSV ranges
+        // Kept apart from 003 on purpose. Swift encodes [ColorRange: T] as an *unkeyed* alternating
+        // key/value array, because ColorRange is not CodingKeyRepresentable, and that array's order
+        // is Dictionary hash order rather than declaration order. This case records what the order
+        // actually was, and saves the same document twice so the log shows whether it is even
+        // stable within a single run. If those two differ, no byte-exact comparison of an HSV
+        // document is possible for anyone, including the app that wrote it.
+        let hsvSession = EditorSession()
+        hsvSession.createDocument(width: 4, height: 4, resolution: 300)
+        hsvSession.addBlankLayer()
+        hsvSession.addAdjustment(.hsv)
+        if let id = hsvSession.projectSnapshot()?.manifest.layers.last?.id {
+            var value = LayerAdjustment(kind: .hsv)
+            var settings = HueSaturationSettings(hue: 10, saturation: 20, lightness: 30, range: .reds)
+            settings.range = .yellows
+            settings.colorize = true
+            settings.invertRange = true
+            settings.adjustments[.yellows] = RangeAdjustment(hue: 11, saturation: 21, lightness: 31)
+            settings.adjustments[.greens] = RangeAdjustment(hue: 12, saturation: 22, lightness: 32)
+            value.hsvSettings = settings
+            if value.isValid {
+                hsvSession.updateAdjustment(id, value: value)
+            } else {
+                print("004 ERROR: the HSV adjustment is not valid, so updateAdjustment will refuse it")
+            }
+        }
+        let hsvSnapshot = try #require(hsvSession.projectSnapshot(), "HSV session produced no snapshot")
+        let hsvComp = out.appendingPathComponent("004-hsv.comp", isDirectory: true)
+        try await ProjectStore.shared.save(hsvSnapshot, to: hsvComp)
+        let hsvManifest = try Data(contentsOf: hsvComp.appendingPathComponent("manifest.json"))
+        print("=== BEGIN 004-hsv.manifest.json (\(hsvManifest.count) bytes) ===")
+        print(String(decoding: hsvManifest, as: UTF8.self))
+        print("=== END 004-hsv.manifest.json ===")
+        artifacts.append(try Self.write(hsvManifest, to: "004-hsv.manifest.json", in: out))
+
+        let hsvAgain = out.appendingPathComponent("004-hsv-again.comp", isDirectory: true)
+        try await ProjectStore.shared.save(hsvSnapshot, to: hsvAgain)
+        let hsvAgainManifest = try Data(contentsOf: hsvAgain.appendingPathComponent("manifest.json"))
+        print("004 second save byte-identical to the first: \(hsvAgainManifest == hsvManifest)")
+        artifacts.append(try Self.write(hsvAgainManifest, to: "004-hsv-again.manifest.json", in: out))
 
         // ---------------------------------------------------------------- metadata
         // Recorded because several of these are machine-dependent and must be known when
