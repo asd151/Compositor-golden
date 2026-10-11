@@ -689,6 +689,105 @@ struct GoldenDump {
             print("008 ERROR: the folder stack could not be rendered: \(error)")
         }
 
+        // ---------------------------------------------------------------- 009 folder masks
+        //
+        // Case 008 established that a folder is pass-through: its opacity multiplies into each layer
+        // inside it. This is the other half of the same idea - a folder's mask clips each of those
+        // layers, multiplied with the layer's own mask.
+        //
+        // The part most likely to be got wrong is the edge of the mask's rect. Core Graphics intersects
+        // the current clip with the mask's rect and the mask's coverage in one operation
+        // (LayerMask.swift:178-187), so a folder mask smaller than the canvas does not merely fade what
+        // is under it - it ERASES everything inside the folder that falls outside that rect. Treating a
+        // mask as "multiply by the coverage, 1 outside it" is the natural misreading, and the "edge"
+        // layer below sits half in and half out of the folder's rect specifically to catch it.
+        //
+        // The folder here covers (4,3) to (28,23) of a 40x32 canvas:
+        //
+        //     base      (0,0) 40x32   outside the folder, must be untouched
+        //     folder    (4,3) 24x20   the folder, carrying a 24x20 mask
+        //     inside    (6,6) 16x16   wholly inside; folder mask only
+        //     both     (16,10) 20x14   inside, and carrying its own mask too - the two multiply
+        //     edge      (0,0) 10x10   half outside the folder's rect; the outside half must vanish
+        //     outside  (20,2) 16x16   not in the folder at all, must be untouched
+        let maskCanvasWidth = 40
+        let maskCanvasHeight = 32
+
+        typealias MaskedFolderLayer = (String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode,
+                                       Bool, CGFloat, Bool, String?, Bool)
+        let maskStack: [MaskedFolderLayer] = [
+            ("base",    0, maskCanvasWidth, maskCanvasHeight,  0,  0, 1.0, .normal, false, 0, false, nil,      true),
+            ("folder",  0, 24,              20,                4,  3, 1.0, .normal, true,  0, true,  nil,      true),
+            ("inside",  1, 16,              16,                6,  6, 1.0, .normal, false, 0, false, "folder", true),
+            ("both",    2, 20,              14,               16, 10, 1.0, .normal, true,  0, false, "folder", true),
+            ("edge",    3, 10,              10,                0,  0, 1.0, .normal, false, 0, false, "folder", true),
+            ("outside", 1, 16,              16,               20,  2, 1.0, .normal, false, 0, false, nil,      true),
+        ]
+
+        var maskIds: [String: UUID] = [:]
+        var maskRecords: [ProjectLayerRecord] = []
+        var maskImages: [UUID: ImportedImage] = [:]
+        var maskAssets: [UUID: ImportedImage] = [:]
+
+        for (slug, variant, pixelWidth, pixelHeight, x, y, opacity, blend,
+             masked, rotation, isGroup, parent, visible) in maskStack {
+            let id = UUID()
+            maskIds[slug] = id
+            if !isGroup {
+                guard let raster = Self.stackRaster(width: pixelWidth, height: pixelHeight, variant: variant),
+                      let thumbnail = Self.stackRaster(width: max(1, pixelWidth / 2), height: max(1, pixelHeight / 2),
+                                                       variant: variant) else {
+                    print("009 ERROR: could not build the \(slug) raster")
+                    continue
+                }
+                maskImages[id] = ImportedImage(image: raster, thumbnail: thumbnail, name: slug)
+            }
+            var maskFile: String? = nil
+            if masked, let mask = Self.stackMask(width: pixelWidth, height: pixelHeight) {
+                maskAssets[id] = ImportedImage(image: mask.image, thumbnail: mask.image, name: "\(slug)-mask")
+                maskFile = "\(slug)-mask.png"
+            }
+            maskRecords.append(ProjectLayerRecord(
+                id: id, name: slug, isVisible: visible,
+                transform: LayerTransform(origin: CGPoint(x: x, y: y),
+                                          size: CGSize(width: pixelWidth, height: pixelHeight),
+                                          rotation: rotation),
+                imageFile: isGroup ? nil : "\(slug).png",
+                parentID: parent.flatMap { maskIds[$0] },
+                isGroup: isGroup, opacity: opacity, blendMode: blend,
+                maskFile: maskFile))
+        }
+
+        do {
+            let maskManifest = ProjectManifest(documentID: UUID(), width: maskCanvasWidth, height: maskCanvasHeight,
+                                               activeLayerID: nil, layers: maskRecords)
+            let maskRendered = try await ImageExporter.shared.render(
+                ProjectSnapshot(manifest: maskManifest, images: maskImages, masks: maskAssets))
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: maskRendered.image),
+                                                         "009 folder mask stack produced no bytes"),
+                                            to: "009-stack.raw", in: out))
+
+            // The folder's own mask on its own, dumped so the far side can check its placement before
+            // judging what the clip did with it. Without this a wrong mask would look like a wrong clip.
+            if let folderMask = maskAssets[maskIds["folder"]!] {
+                artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: folderMask.image),
+                                                             "009 folder mask produced no bytes"),
+                                                to: "009-folder-mask.raw", in: out))
+            }
+
+            let described: [[String: Any]] = maskStack.map { layer in
+                ["slug": layer.0, "variant": layer.1, "pixelWidth": layer.2, "pixelHeight": layer.3,
+                 "x": Double(layer.4), "y": Double(layer.5), "opacity": layer.6,
+                 "blend": layer.7.rawValue, "masked": layer.8, "rotation": Double(layer.9),
+                 "isGroup": layer.10, "parent": layer.11 ?? "", "visible": layer.12]
+            }
+            artifacts.append(try Self.write(try JSONSerialization.data(
+                withJSONObject: ["width": maskCanvasWidth, "height": maskCanvasHeight, "layers": described],
+                options: [.prettyPrinted, .sortedKeys]), to: "009-masks.json", in: out))
+        } catch {
+            print("009 ERROR: the folder mask stack could not be rendered: \(error)")
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
