@@ -457,6 +457,132 @@ struct GoldenDump {
                                                                    options: [.prettyPrinted, .sortedKeys]),
                                         to: "006-modes.json", in: out))
 
+        // ---------------------------------------------------------------- 007 layer stack
+        //
+        // Cases 005 and 006 cover single-raster work: a kernel over one image, and one blend of two.
+        // Neither exercises the thing an image editor actually does, which is put several layers at
+        // several places on one canvas and resolve them in order. This renders a real layer stack
+        // through ImageExporter - the same path export uses, with no UI in it - and dumps the result.
+        //
+        // The stack is split into two artifacts on purpose, because only one of them can be exact:
+        //
+        //   * The "exact" stack places every layer unrotated, unscaled and on whole pixels with a
+        //     sampling mode that resolves to no resampling at all. LayerRenderer returns .none for an
+        //     upright layer landing pixel for pixel (LayerRenderer.swift:44-47), so its pixels are
+        //     copied rather than filtered, and what remains is placement, opacity, masking and blending
+        //     - all of which are arithmetic the port can match.
+        //   * The "rotated" stack adds one rotated layer. That goes through Core Graphics' resampling,
+        //     which is closed, so it is dumped to measure where exactness ends rather than to be
+        //     matched. Reporting it is the point; asserting it would be a lie.
+        //
+        // Orientation is checked rather than assumed. ImageExporter's context is flipped
+        // (ImageExporter.swift:32-33), and case 006 already showed that drawing into a flipped context
+        // mirrors the raster. LayerRenderer compensates with its own scaleBy(y: -1) for a layer that is
+        // not flipped (LayerRenderer.swift:22), so the export should come out upright - but that is a
+        // deduction, and the first artifact here exists to test it: the base layer fills the whole
+        // canvas at 1:1, so if the render is upright the output starts out byte-equal to that raster.
+        let stackWidth = 40
+        let stackHeight = 32
+
+        // slug, raster variant, pixel size, origin, opacity, blend, masked
+        let exactStack: [(String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode, Bool)] = [
+            ("base", 0, stackWidth, stackHeight, 0, 0, 1.0, .normal, false),
+            ("multiply", 1, 16, 16, 8, 6, 0.6, .multiply, false),
+            ("screen", 2, 24, 18, 5, 10, 0.85, .screen, false),
+            ("masked", 3, 20, 14, 12, 4, 1.0, .normal, true),
+        ]
+        let rotatedLayer = ("rotated", 1, 12, 12, CGFloat(26), CGFloat(18), 0.7, LayerBlendMode.normal, CGFloat(17))
+
+        /// Builds a snapshot from a layer list, in the order the manifest stores them: bottom first.
+        func stackSnapshot(_ layers: [(String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode, Bool)])
+            -> (ProjectSnapshot, [String: CGImage], [String: Data]) {
+            var records: [ProjectLayerRecord] = []
+            var images: [UUID: ImportedImage] = [:]
+            var masks: [UUID: ImportedImage] = [:]
+            var rasters: [String: CGImage] = [:]
+            var maskBytes: [String: Data] = [:]
+
+            for (slug, variant, pixelWidth, pixelHeight, x, y, opacity, blend, masked) in layers {
+                let id = UUID()
+                guard let raster = Self.stackRaster(width: pixelWidth, height: pixelHeight, variant: variant),
+                      let thumbnail = Self.stackRaster(width: max(1, pixelWidth / 2), height: max(1, pixelHeight / 2),
+                                                       variant: variant) else {
+                    print("007 ERROR: could not build the \(slug) raster")
+                    continue
+                }
+                rasters[slug] = raster
+                records.append(ProjectLayerRecord(
+                    id: id, name: slug, isVisible: true,
+                    transform: LayerTransform(origin: CGPoint(x: x, y: y),
+                                              size: CGSize(width: pixelWidth, height: pixelHeight)),
+                    imageFile: "\(slug).png", opacity: opacity, blendMode: blend,
+                    maskFile: masked ? "\(slug)-mask.png" : nil))
+                images[id] = ImportedImage(image: raster, thumbnail: thumbnail, name: slug)
+
+                if masked, let mask = Self.stackMask(width: pixelWidth, height: pixelHeight) {
+                    masks[id] = ImportedImage(image: mask.image, thumbnail: mask.image, name: "\(slug)-mask")
+                    maskBytes[slug] = mask.bytes
+                }
+            }
+
+            let manifest = ProjectManifest(documentID: UUID(), width: stackWidth, height: stackHeight,
+                                           activeLayerID: records.last?.id, layers: records)
+            return (ProjectSnapshot(manifest: manifest, images: images, masks: masks), rasters, maskBytes)
+        }
+
+        do {
+            let (exactSnapshot, exactRasters, exactMasks) = stackSnapshot(exactStack)
+            let exactRendered = try await ImageExporter.shared.render(exactSnapshot)
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: exactRendered.image),
+                                                         "007 exact stack produced no bytes"),
+                                            to: "007-stack-exact.raw", in: out))
+
+            // The base raster on its own: the same full-canvas, opaque, 1:1 layer as the bottom of the
+            // stack, so the C# side can tell an upright render from a mirrored one before judging the
+            // rest. Kept separate from the composite so that check does not depend on any other layer.
+            if let base = exactRasters["base"], let bytes = Self.rgbaBytes(of: base) {
+                artifacts.append(try Self.write(bytes, to: "007-base.raw", in: out))
+            }
+            for (slug, raster) in exactRasters.sorted(by: { $0.key < $1.key }) {
+                guard let bytes = Self.rgbaBytes(of: raster) else { continue }
+                artifacts.append(try Self.write(bytes, to: "007-layer-\(slug).raw", in: out))
+            }
+            for (slug, bytes) in exactMasks.sorted(by: { $0.key < $1.key }) {
+                artifacts.append(try Self.write(bytes, to: "007-mask-\(slug).raw", in: out))
+            }
+
+            var rotatedStack = exactStack
+            rotatedStack.append(rotatedLayer)
+            let (rotatedSnapshot, rotatedRasters, _) = stackSnapshot(rotatedStack)
+            let rotatedRendered = try await ImageExporter.shared.render(rotatedSnapshot)
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rotatedRendered.image),
+                                                         "007 rotated stack produced no bytes"),
+                                            to: "007-stack-rotated.raw", in: out))
+            if let raster = rotatedRasters["rotated"], let bytes = Self.rgbaBytes(of: raster) {
+                artifacts.append(try Self.write(bytes, to: "007-layer-rotated.raw", in: out))
+            }
+
+            // The layer list, dumped rather than left implicit. The C# side rebuilds the same stack from
+            // these numbers instead of hard-coding a second copy that could drift from this one.
+            var described: [[String: Any]] = []
+            for (slug, variant, pixelWidth, pixelHeight, x, y, opacity, blend, masked) in exactStack {
+                described.append(["slug": slug, "variant": variant, "pixelWidth": pixelWidth,
+                                  "pixelHeight": pixelHeight, "x": Double(x), "y": Double(y),
+                                  "opacity": opacity, "blend": blend.rawValue, "masked": masked,
+                                  "rotation": 0.0])
+            }
+            let (rs, rv, rw, rh, rx, ry, rop, rb, _) = rotatedLayer
+            described.append(["slug": rs, "variant": rv, "pixelWidth": rw, "pixelHeight": rh,
+                              "x": Double(rx), "y": Double(ry), "opacity": rop, "blend": rb.rawValue,
+                              "masked": false, "rotation": 17.0])
+            artifacts.append(try Self.write(try JSONSerialization.data(
+                withJSONObject: ["width": stackWidth, "height": stackHeight,
+                                 "exactCount": exactStack.count, "layers": described],
+                options: [.prettyPrinted, .sortedKeys]), to: "007-stack.json", in: out))
+        } catch {
+            print("007 ERROR: the layer stack could not be rendered: \(error)")
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
@@ -612,6 +738,65 @@ struct GoldenDump {
             }
         }
         return out
+    }
+
+    /// A layer's pixels for case 007, from a closed form for the same reason as everywhere else: the C#
+    /// side rebuilds it from identical integer arithmetic, so a disagreement is about the stack and not
+    /// about the input.
+    ///
+    /// Four variants with no slope shared between them, so no variant can be mistaken for another and
+    /// every channel depends on both axes - a transposed or mirrored raster cannot match by accident.
+    static func stackRaster(width: Int, height: Int, variant: Int) -> CGImage? {
+        var bytes = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            for x in 0..<width {
+                let i = (y * width + x) * 4
+                let r: Int, g: Int, b: Int
+                switch variant {
+                case 0: r = (x * 13 + y * 5) % 256; g = (x * 7 + y * 19) % 256; b = (x * 23 + y * 11) % 256
+                case 1: r = (x * 29 + y * 17) % 256; g = (x * 3 + y * 31) % 256; b = (x * 13 + y * 37) % 256
+                case 2: r = (x * 11 + y * 41) % 256; g = (x * 43 + y * 9) % 256; b = (x * 17 + y * 27) % 256
+                default: r = (x * 37 + y * 29) % 256; g = (x * 19 + y * 23) % 256; b = (x * 5 + y * 47) % 256
+                }
+                bytes[i] = UInt8(r)
+                bytes[i + 1] = UInt8(g)
+                bytes[i + 2] = UInt8(b)
+                bytes[i + 3] = 255
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4,
+                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// A layer's mask for case 007, as the app stores one: single-channel Gray8 at the layer's pixel size.
+    ///
+    /// Returned as raw bytes alongside the image because the mask is compared as coverage, not as color,
+    /// and reading a gray image back through a color context would convert it.
+    static func stackMask(width: Int, height: Int) -> (image: CGImage, bytes: Data)? {
+        var bytes = [UInt8](repeating: 0, count: width * height)
+        for y in 0..<height {
+            for x in 0..<width {
+                // A soft-edged blob rather than the full range: a mask that is 0 or 255 almost everywhere
+                // would pass even if the coverage multiply were wrong by a whole step.
+                let dx = Double(x) - Double(width) / 2.0 + 0.5
+                let dy = Double(y) - Double(height) / 2.0 + 0.5
+                let distance = (dx * dx + dy * dy).squareRoot()
+                let radius = Double(min(width, height)) / 2.0
+                let coverage = max(0.0, min(1.0, 1.0 - distance / radius))
+                bytes[y * width + x] = UInt8((coverage * 255.0).rounded())
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData) else { return nil }
+        guard let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 8,
+                                  bytesPerRow: width, space: CGColorSpaceCreateDeviceGray(),
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: false,
+                                  intent: .defaultIntent) else { return nil }
+        return (image, Data(bytes))
     }
 
     /// Reads an image back as premultiplied RGBA8, in the layout the port uses.
