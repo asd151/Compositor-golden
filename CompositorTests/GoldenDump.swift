@@ -769,10 +769,13 @@ struct GoldenDump {
 
             // The folder's own mask on its own, dumped so the far side can check its placement before
             // judging what the clip did with it. Without this a wrong mask would look like a wrong clip.
-            if let folderMask = maskAssets[maskIds["folder"]!] {
-                artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: folderMask.image),
-                                                             "009 folder mask produced no bytes"),
-                                                to: "009-folder-mask.raw", in: out))
+            //
+            // Dumped from the image's own data provider rather than drawn into a context: a Gray8 mask
+            // read back through a color space would be color-managed, and the point is to hand over the
+            // exact bytes the clipper was given.
+            if let folderMask = maskAssets[maskIds["folder"]!],
+               let gray = folderMask.image.dataProvider?.data {
+                artifacts.append(try Self.write(gray as Data, to: "009-folder-mask.raw", in: out))
             }
 
             let described: [[String: Any]] = maskStack.map { layer in
