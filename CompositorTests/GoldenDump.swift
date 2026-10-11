@@ -581,6 +581,114 @@ struct GoldenDump {
             print("007 ERROR: the layer stack could not be rendered: \(error)")
         }
 
+        // ---------------------------------------------------------------- 008 folders
+        //
+        // Case 007 stacks flat layers, which is the easy half of a stack. This adds folders, and folders
+        // are where a port most easily invents compositing the original does not do.
+        //
+        // The Mac app does NOT composite a folder as a unit. Its own comment says so plainly: "Folders
+        // are pass-through - what's inside is drawn straight onto what is below, never composited as a
+        // unit - so the folder's opacity is applied to each of those layers rather than to the folder as
+        // a whole" (LayerGroups.swift:49-52). A folder therefore contributes exactly two things to the
+        // layers inside it: its opacity, multiplied into each child, and its mask, which clips each
+        // child. Its own blend mode is never applied.
+        //
+        // So the interesting numbers here are the effective opacities, chosen so that a port which
+        // composites folders as groups lands somewhere different:
+        //
+        //     base        own 1.00                             -> 1.00
+        //     inside-a    own 0.80, inside folder 0.70         -> 0.56
+        //     inside-b    own 1.00, inside folder 0.70         -> 0.70
+        //     deep        own 1.00, inside nested 0.50,
+        //                          inside folder 0.70         -> 0.35
+        //     top         own 0.90                             -> 0.90
+        //
+        // 0.56 and 0.35 are deliberately not representable in eight bits, so a port that rounds a
+        // folder opacity on the way down, or applies it as a second blend instead of one multiplication,
+        // cannot land on the same bytes by luck.
+        //
+        // A hidden folder is included too: nothing inside it may be drawn. The check is that the render
+        // matches one built without it at all, rather than that it merely looks plausible.
+        let folderWidth = 40
+        let folderHeight = 32
+
+        // slug, variant, pixel w/h, origin, opacity, blend, masked, rotation, isGroup, parent slug, visible
+        typealias FolderLayer = (String, Int, Int, Int, CGFloat, CGFloat, Double, LayerBlendMode,
+                                 Bool, CGFloat, Bool, String?, Bool)
+        let folderStack: [FolderLayer] = [
+            ("base",       0, folderWidth, folderHeight,  0,  0, 1.00, .normal,   false, 0, false, nil,      true),
+            ("folder",     0, folderWidth, folderHeight,  0,  0, 0.70, .normal,   false, 0, true,  nil,      true),
+            ("inside-a",   1, 16,          16,            4,  4, 0.80, .normal,   false, 0, false, "folder", true),
+            ("inside-b",   2, 20,          12,           14, 10, 1.00, .multiply, false, 0, false, "folder", true),
+            ("nested",     0, folderWidth, folderHeight,  0,  0, 0.50, .normal,   false, 0, true,  "folder", true),
+            ("deep",       3, 12,          12,           22,  6, 1.00, .normal,   false, 0, false, "nested", true),
+            ("top",        1, 18,          18,           10, 12, 0.90, .screen,   false, 0, false, nil,      true),
+            // Inside a folder that is switched off. Neither may reach the canvas.
+            ("dark",       0, folderWidth, folderHeight,  0,  0, 1.00, .normal,   false, 0, true,  nil,      false),
+            ("dark-child", 1, 16,          16,            2,  2, 1.00, .difference, false, 0, false, "dark", true),
+        ]
+
+        var folderIds: [String: UUID] = [:]
+        var folderRecords: [ProjectLayerRecord] = []
+        var folderImages: [UUID: ImportedImage] = [:]
+
+        for (slug, variant, pixelWidth, pixelHeight, x, y, opacity, blend,
+             masked, rotation, isGroup, parent, visible) in folderStack {
+            let id = UUID()
+            folderIds[slug] = id
+            if !isGroup {
+                guard let raster = Self.stackRaster(width: pixelWidth, height: pixelHeight, variant: variant),
+                      let thumbnail = Self.stackRaster(width: max(1, pixelWidth / 2), height: max(1, pixelHeight / 2),
+                                                       variant: variant) else {
+                    print("008 ERROR: could not build the \(slug) raster")
+                    continue
+                }
+                folderImages[id] = ImportedImage(image: raster, thumbnail: thumbnail, name: slug)
+            }
+            folderRecords.append(ProjectLayerRecord(
+                id: id, name: slug, isVisible: visible,
+                transform: LayerTransform(origin: CGPoint(x: x, y: y),
+                                          size: CGSize(width: pixelWidth, height: pixelHeight),
+                                          rotation: rotation),
+                imageFile: isGroup ? nil : "\(slug).png",
+                parentID: parent.flatMap { folderIds[$0] },
+                isGroup: isGroup, opacity: opacity, blendMode: blend,
+                maskFile: masked ? "\(slug)-mask.png" : nil))
+        }
+
+        do {
+            let folderManifest = ProjectManifest(documentID: UUID(), width: folderWidth, height: folderHeight,
+                                                 activeLayerID: nil, layers: folderRecords)
+            let folderRendered = try await ImageExporter.shared.render(
+                ProjectSnapshot(manifest: folderManifest, images: folderImages, masks: [:]))
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: folderRendered.image),
+                                                         "008 folder stack produced no bytes"),
+                                            to: "008-stack.raw", in: out))
+
+            // The same stack with the hidden folder taken out entirely. The far side asserts the two
+            // renders are identical, which is what "switched off" has to mean.
+            let shownRecords = folderRecords.filter { $0.name != "dark" && $0.name != "dark-child" }
+            let shownManifest = ProjectManifest(documentID: UUID(), width: folderWidth, height: folderHeight,
+                                                activeLayerID: nil, layers: shownRecords)
+            let shownRendered = try await ImageExporter.shared.render(
+                ProjectSnapshot(manifest: shownManifest, images: folderImages, masks: [:]))
+            artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: shownRendered.image),
+                                                         "008 visible-only stack produced no bytes"),
+                                            to: "008-stack-without-hidden.raw", in: out))
+
+            let described: [[String: Any]] = folderStack.map { layer in
+                ["slug": layer.0, "variant": layer.1, "pixelWidth": layer.2, "pixelHeight": layer.3,
+                 "x": Double(layer.4), "y": Double(layer.5), "opacity": layer.6,
+                 "blend": layer.7.rawValue, "masked": layer.8, "rotation": Double(layer.9),
+                 "isGroup": layer.10, "parent": layer.11 ?? "", "visible": layer.12]
+            }
+            artifacts.append(try Self.write(try JSONSerialization.data(
+                withJSONObject: ["width": folderWidth, "height": folderHeight, "layers": described],
+                options: [.prettyPrinted, .sortedKeys]), to: "008-folders.json", in: out))
+        } catch {
+            print("008 ERROR: the folder stack could not be rendered: \(error)")
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
