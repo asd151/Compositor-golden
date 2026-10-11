@@ -121,8 +121,19 @@ struct GoldenDump {
         adjust.addBlankLayer()
 
         func setAdjustment(_ kind: AdjustmentKind, _ mutate: (inout LayerAdjustment) -> Void) {
+            // Capture the layer set first, so the new layer is identified by difference rather than
+            // by position. addAdjustment inserts relative to the active layer, and assuming "last"
+            // is the new one is exactly the kind of guess that silently wrote every setting onto a
+            // single layer in the first version of this case.
+            let before = Set(adjust.projectSnapshot()?.manifest.layers.map(\.id) ?? [])
             adjust.addAdjustment(kind)
-            guard let id = adjust.projectSnapshot()?.manifest.layers.last?.id else {
+            // addAdjustment opens the new adjustment's editor for every kind except Invert, and
+            // canEditLayers refuses any further layer edit while an editor is open. Without closing
+            // it here, the second and every later call is ignored: the run produces one adjustment
+            // layer carrying whichever kind was set last, and nothing says so.
+            adjust.adjustmentEditingID = nil
+            guard let snapshot = adjust.projectSnapshot(),
+                  let layer = snapshot.manifest.layers.first(where: { !before.contains($0.id) }) else {
                 print("003 ERROR: \(kind.rawValue) was not added")
                 return
             }
@@ -134,9 +145,10 @@ struct GoldenDump {
                 print("003 ERROR: \(kind.rawValue) is not valid, so updateAdjustment will refuse it")
                 return
             }
-            adjust.updateAdjustment(id, value: value)
-            if adjust.projectSnapshot()?.manifest.layers.last?.adjustment?.isValid != true {
-                print("003 ERROR: \(kind.rawValue) did not take")
+            adjust.updateAdjustment(layer.id, value: value)
+            let landed = adjust.projectSnapshot()?.manifest.layers.first { $0.id == layer.id }?.adjustment
+            if landed?.kind != kind {
+                print("003 ERROR: \(kind.rawValue) did not take, layer has \(String(describing: landed?.kind))")
             }
         }
 
@@ -196,7 +208,14 @@ struct GoldenDump {
         }
 
         let adjustSnapshot = try #require(adjust.projectSnapshot(), "adjustment session produced no snapshot")
-        print("003 kinds: \(adjustSnapshot.manifest.layers.compactMap { $0.adjustment?.kind.rawValue })")
+        let landedKinds = adjustSnapshot.manifest.layers.compactMap { $0.adjustment?.kind.rawValue }
+        print("003 kinds: \(landedKinds)")
+        // The first attempt at this case produced a 3427-byte "adjustment corpus" holding a single
+        // kind, because a guard refused eleven of the twelve inserts and nothing checked. A dump that
+        // writes fewer cases than intended is worse than no dump, so it says so out loud.
+        if landedKinds.count != 12 {
+            print("003 ERROR: expected 12 adjustment layers, got \(landedKinds.count)")
+        }
         let adjustComp = out.appendingPathComponent("003-adjustments.comp", isDirectory: true)
         try await ProjectStore.shared.save(adjustSnapshot, to: adjustComp)
         let adjustManifest = try Data(contentsOf: adjustComp.appendingPathComponent("manifest.json"))
