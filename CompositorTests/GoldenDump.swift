@@ -1175,6 +1175,120 @@ struct GoldenDump {
             }
         }
 
+        // ---------------------------------------------------------------- 014 camera raw Curve and Color
+        //
+        // This group does not hand the kernel its amounts. It hands it LOOKUP TABLES: 256 floats for the
+        // tone curve and 256 for each channel curve, all built here in Swift. So a difference anywhere in
+        // the curve arithmetic shows up as a table a level or two off, spread across the whole image -
+        // which is exactly the kind of mismatch that is hard to attribute from pixels alone.
+        //
+        // The parametric curve is the part worth isolating. Its two bends nest: the inner one uses the
+        // shadow and light dividers with the Shadow and Highlight amounts, the outer uses the dark
+        // divider for BOTH of its sides with the Darks and Lights amounts. Reading the arguments off one
+        // call and reusing them for the other gives a curve that still rises, still looks like a tone
+        // curve, and is wrong.
+        //
+        // The point curves are evaluated through the same spline as the Curves filter, so they are not
+        // dumped separately here - what is new is the composition order, parametric first and then the
+        // composite point curve over it.
+        //
+        // Color Grading and the Color Mixer share the kernel, so all three run together in the combined
+        // case at the end, after a grade, in the order the pipeline runs them.
+
+        if let rawInput = Self.rawRaster(width: rawWidth, height: rawHeight) {
+            // The parametric curve alone, with dividers that do not sit on their defaults.
+            var parametric = CameraRawSettings()
+            parametric.curve.shadows = 40
+            parametric.curve.darks = -55
+            parametric.curve.lights = 35
+            parametric.curve.highlights = -25
+            parametric.curve.shadowSplit = 18
+            parametric.curve.darkSplit = 44
+            parametric.curve.lightSplit = 82
+
+            // The point curves alone, with a composite curve that also moves saturation.
+            var pointCurve = CameraRawSettings()
+            pointCurve.curve.rgb = [CurvePoint(x: 0, y: 0.04), CurvePoint(x: 0.3, y: 0.2),
+                                    CurvePoint(x: 0.7, y: 0.86), CurvePoint(x: 1, y: 0.98)]
+            pointCurve.curve.red = [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.5, y: 0.62), CurvePoint(x: 1, y: 1)]
+            pointCurve.curve.green = [CurvePoint(x: 0, y: 0.02), CurvePoint(x: 0.5, y: 0.4), CurvePoint(x: 1, y: 1)]
+            pointCurve.curve.blue = [CurvePoint(x: 0, y: 0), CurvePoint(x: 0.25, y: 0.1),
+                                     CurvePoint(x: 0.75, y: 0.9), CurvePoint(x: 1, y: 1)]
+            pointCurve.curve.refineSaturation = -45
+
+            // The Color Mixer: all eight families, plus two picked colors.
+            var mixer = CameraRawSettings()
+            mixer.mixer.hue = [12, -8, 20, -30, 15, -18, 25, -10]
+            mixer.mixer.saturation = [-20, 30, -40, 25, -15, 35, -25, 18]
+            mixer.mixer.luminance = [15, -25, 10, -35, 20, -12, 30, -22]
+            mixer.mixer.points = [
+                CameraRawPointColor(hue: 25, saturation: 0.7, luminance: 0.5,
+                                    hueShift: 30, saturationShift: -40, luminanceShift: 20,
+                                    hueRange: 45, saturationRange: 0.6, luminanceRange: 0.3),
+                CameraRawPointColor(hue: 210, saturation: 0.4, luminance: 0.6,
+                                    hueShift: -25, saturationShift: 35, luminanceShift: -15,
+                                    hueRange: 60, saturationRange: 0.5, luminanceRange: 0.7),
+            ]
+
+            // Color Grading: all four wheels, with blending and balance off their defaults.
+            var grading = CameraRawSettings()
+            grading.grading.shadows = CameraRawGradeWheel(hue: 220, saturation: 40, luminance: -15)
+            grading.grading.midtones = CameraRawGradeWheel(hue: 40, saturation: 25, luminance: 10)
+            grading.grading.highlights = CameraRawGradeWheel(hue: 55, saturation: 30, luminance: 20)
+            grading.grading.global = CameraRawGradeWheel(hue: 300, saturation: 15, luminance: -5)
+            grading.grading.blending = 65
+            grading.grading.balance = -30
+
+            // All three at once, after a grade, in the order the pipeline runs them.
+            var curveColor = CameraRawSettings()
+            curveColor.temperature = 30
+            curveColor.exposure = 0.35
+            curveColor.contrast = 20
+            curveColor.shadows = 30
+            curveColor.curve = parametric.curve
+            curveColor.mixer = mixer.mixer
+            curveColor.grading = grading.grading
+
+            let renders: [(String, CameraRawSettings, CGFloat, UInt32)] = [
+                ("014-curve-parametric.raw", parametric, 1, 0),
+                ("014-curve-point.raw", pointCurve, 1, 0),
+                ("014-mixer.raw", mixer, 1, 0),
+                ("014-grading.raw", grading, 1, 0),
+                ("014-curve-color.raw", curveColor, 1, 0),
+            ]
+            for (name, settings, renderScale, renderSeed) in renders {
+                do {
+                    let rendered = try settings.apply(rawInput, scale: renderScale, seed: renderSeed)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                } catch {
+                    print("014 ERROR: \(name) failed: \(error)")
+                }
+            }
+
+            // The option-drag clipping overlay, which is a preview of the grade rather than a grade: it
+            // is drawn BY the basic grade, so the amounts have to be non-neutral to have anything to
+            // clip. It is dumped for both directions.
+            var clippingSource = CameraRawSettings()
+            clippingSource.exposure = 1.4
+            clippingSource.highlights = 70
+            clippingSource.whites = 60
+            clippingSource.shadows = -50
+            clippingSource.blacks = -45
+            for (name, mode) in [("014-clip-highlights.raw", CameraRawClipping.highlights),
+                                 ("014-clip-shadows.raw", CameraRawClipping.shadows)] {
+                do {
+                    let rendered = try clippingSource.apply(rawInput, clipping: mode)
+                    artifacts.append(try Self.write(try #require(Self.rgbaBytes(of: rendered),
+                                                                 "\(name) produced no bytes"),
+                                                    to: name, in: out))
+                } catch {
+                    print("014 ERROR: \(name) failed: \(error)")
+                }
+            }
+        }
+
         // ---------------------------------------------------------------- package listing
         // A sorted path / size / SHA-256 index, so the C# harness never has to enumerate a
         // filesystem to know what a golden contains. Paths are relative to the corpus root
