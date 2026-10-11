@@ -1143,6 +1143,7 @@ struct GoldenDump {
 
             let renders: [(String, CameraRawSettings, CGFloat, UInt32)] = [
                 ("013-detail.raw", detail, 1, 0),
+                ("013-detail-scaled.raw", detail, 2, 0),
                 ("013-optics-profile.raw", opticsOn, 1, 0),
                 ("013-optics-no-profile.raw", opticsOff, 1, 0),
                 ("013-optics-scaled.raw", opticsOn, 2, 0),
